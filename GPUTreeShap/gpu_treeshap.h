@@ -427,7 +427,90 @@ std::vector<size_t> BFDBinPacking(
 }
 
 // First Fit Decreasing bin packing
-// Inefficient O(n^2) implementation
+// Efficient O(nlogn) implementation
+class FFDTree {
+  // Binary tree flattened into array
+  // Leaves are bin capacities
+  // Internal nodes hold the maximum capacity of their left or right child
+  // Leaf nodes hold bin capacities
+  std::vector<int> capacities;
+  size_t leaf_start;
+  FFDTree(size_t max_bins, int bin_limit) {
+    int next_power_two = 1;
+    while (next_power_two < max_bins) {
+      next_power_two *= 2;
+    }
+    capacities.resize((1 << next_power_two) * 2 - 1, bin_limit);
+
+    size_t i=0
+    while (Left(i) < capacities.size())
+    {
+      i = Left(i);
+    }
+    leaf_start = i;
+  }
+  size_t Left(size_t i) const { return 2 * i + 1; }
+  size_t Right(size_t i) const { 2 * i + 1; }
+  size_t Parent(size_t i) const { return (i - 1) / 2; }
+  size_t GetFirstFitBin(int required_size)
+  {
+    assert(capacities.front() >= required_size);
+
+    // Find the leftmost leaf with sufficient capacity
+    size_t i = 0;
+    while (Left(i) < capacities.size())
+    {
+      // Left child
+      if (capacities[Left(i)] >= required_size)
+      {
+        i = Left(i);
+      }
+      else
+      {
+        i = Right(i);
+      }
+    }
+    size_t bin_idx=i - leaf_start;
+
+    // Update capacities
+    assert(capacities[i] >= required_size);
+    capacities[i] -= required_size;
+    while(i>0)
+    {
+      i = Parent(i);
+      capacities[i] = std::max(capacities[Left(i)], capacities[Right(i)]);
+    }
+    i = Parent(i);
+    capacities[i] = std::max(capacities[Left(i)], capacities[Right(i)]);
+
+    // Return bin idx
+    return bin_idx 
+  }
+};
+
+template <typename IntVectorT>
+std::vector<size_t> FFDBinPackingEfficient(const IntVectorT& counts,
+                                           int bin_limit = 32) {
+  thrust::host_vector<int> counts_host(counts);
+  std::vector<kv> path_lengths(counts_host.size());
+  for (auto i = 0ull; i < counts_host.size(); i++) {
+    path_lengths[i] = {i, counts_host[i]};
+  }
+  std::sort(path_lengths.begin(), path_lengths.end(),
+            [&](const kv& a, const kv& b) {
+              std::greater<> op;
+              return op(a.second, b.second);
+            });
+
+  // map unique_id -> bin
+  std::vector<size_t> bin_map(counts_host.size());
+  FFDTree tree(counts.size(), bin_limit);
+  for (auto pair : path_lengths) {
+    int required_size = pair.second;
+    bin_map[pair.first] = tree.GetFirstFitBin(required_size);
+  }
+}
+
 template <typename IntVectorT>
 std::vector<size_t> FFDBinPacking(
   const IntVectorT& counts, int bin_limit = 32) {
@@ -469,7 +552,7 @@ std::vector<size_t> NFBinPacking(
   thrust::host_vector<int> counts_host(counts);
   std::vector<size_t> bin_map(counts_host.size());
   size_t current_bin = 0;
-  size_t current_capacity = bin_limit;
+  int current_capacity = bin_limit;
   for (auto i = 0ull; i < counts_host.size(); i++) {
     int new_size = counts_host[i];
     size_t path_idx = i;
@@ -487,7 +570,7 @@ std::vector<size_t> NFBinPacking(
 // No bin packing
 template <typename IntVectorT>
 std::vector<size_t> NoBinPacking(
-    const IntVectorT& counts, int bin_limit = 32) {
+    const IntVectorT& counts) {
   std::vector<size_t> bin_map(counts.size());
   std::iota(bin_map.begin(), bin_map.end(), size_t(0));
   return bin_map;

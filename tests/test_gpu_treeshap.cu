@@ -424,32 +424,22 @@ TEST(GPUTreeShap, BFDBinPacking) {
   EXPECT_EQ(bin_packing[2], 0u);
 
   counts.clear();
-  counts.resize(12);
-  counts[0] = 3;
-  counts[1] = 3;
-  counts[2] = 3;
+  counts.resize(7);
+  counts[0] = 11;
+  counts[1] = 6;
+  counts[2] = 6;
   counts[3] = 3;
-  counts[4] = 3;
-  counts[5] = 3;
+  counts[4] = 2;
+  counts[5] = 2;
   counts[6] = 2;
-  counts[7] = 2;
-  counts[8] = 2;
-  counts[9] = 2;
-  counts[10] = 2;
-  counts[11] = 2;
-  bin_packing = gpu_treeshap::detail::BFDBinPacking(counts, 10);
+  bin_packing = gpu_treeshap::detail::BFDBinPacking(counts, 16);
   EXPECT_EQ(bin_packing[0], 0u);
-  EXPECT_EQ(bin_packing[1], 0u);
-  EXPECT_EQ(bin_packing[2], 0u);
+  EXPECT_EQ(bin_packing[1], 1u);
+  EXPECT_EQ(bin_packing[2], 1u);
   EXPECT_EQ(bin_packing[3], 1u);
-  EXPECT_EQ(bin_packing[4], 1u);
-  EXPECT_EQ(bin_packing[5], 1u);
+  EXPECT_EQ(bin_packing[4], 0u);
+  EXPECT_EQ(bin_packing[5], 0u);
   EXPECT_EQ(bin_packing[6], 2u);
-  EXPECT_EQ(bin_packing[7], 2u);
-  EXPECT_EQ(bin_packing[8], 2u);
-  EXPECT_EQ(bin_packing[9], 2u);
-  EXPECT_EQ(bin_packing[10], 2u);
-  EXPECT_EQ(bin_packing[11], 3u);
 }
 
 TEST(GPUTreeShap, NFBinPacking) {
