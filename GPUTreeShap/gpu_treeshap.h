@@ -294,6 +294,7 @@ void GetBinSegments(const PathVectorT& paths, const SizeVectorT& bin_map,
                      size_t(0), thrust::maximum<size_t>()) +
       1;
   printf("Bins used %d\n",int(num_bins));
+  printf("Utilisation %f\n",double(paths.size())/(num_bins*32));
   bin_segments->resize(num_bins + 1, 0);
   auto counting = thrust::make_counting_iterator(0llu);
   auto d_paths = paths.data().get();
@@ -430,67 +431,59 @@ std::vector<size_t> BFDBinPacking(
 // Efficient O(nlogn) implementation
 class FFDTree {
   // Binary tree flattened into array
-  // Leaves are bin capacities
   // Internal nodes hold the maximum capacity of their left or right child
   // Leaf nodes hold bin capacities
   std::vector<int> capacities;
   size_t leaf_start;
+  size_t Left(size_t i) const { return 2 * i + 1; }
+  size_t Right(size_t i) const { return 2 * i + 2; }
+  size_t Parent(size_t i) const { return (i - 1) / 2; }
+
+ public:
   FFDTree(size_t max_bins, int bin_limit) {
     int next_power_two = 1;
     while (next_power_two < max_bins) {
       next_power_two *= 2;
     }
-    capacities.resize((1 << next_power_two) * 2 - 1, bin_limit);
+    capacities.resize(next_power_two * 2 - 1, bin_limit);
 
-    size_t i=0
-    while (Left(i) < capacities.size())
-    {
+    size_t i = 0;
+    while (Left(i) < capacities.size()) {
       i = Left(i);
     }
     leaf_start = i;
   }
-  size_t Left(size_t i) const { return 2 * i + 1; }
-  size_t Right(size_t i) const { 2 * i + 1; }
-  size_t Parent(size_t i) const { return (i - 1) / 2; }
-  size_t GetFirstFitBin(int required_size)
-  {
+  size_t GetFirstFitBin(int required_size) {
     assert(capacities.front() >= required_size);
 
     // Find the leftmost leaf with sufficient capacity
     size_t i = 0;
-    while (Left(i) < capacities.size())
-    {
+    while (Left(i) < capacities.size()) {
       // Left child
-      if (capacities[Left(i)] >= required_size)
-      {
+      if (capacities[Left(i)] >= required_size) {
         i = Left(i);
-      }
-      else
-      {
+      } else {
         i = Right(i);
       }
     }
-    size_t bin_idx=i - leaf_start;
+    size_t bin_idx = i - leaf_start;
 
     // Update capacities
     assert(capacities[i] >= required_size);
     capacities[i] -= required_size;
-    while(i>0)
-    {
+    while (i > 0) {
       i = Parent(i);
       capacities[i] = std::max(capacities[Left(i)], capacities[Right(i)]);
     }
-    i = Parent(i);
-    capacities[i] = std::max(capacities[Left(i)], capacities[Right(i)]);
 
     // Return bin idx
-    return bin_idx 
+    return bin_idx;
   }
 };
 
 template <typename IntVectorT>
-std::vector<size_t> FFDBinPackingEfficient(const IntVectorT& counts,
-                                           int bin_limit = 32) {
+std::vector<size_t> FFDBinPacking(const IntVectorT& counts,
+                                  int bin_limit = 32) {
   thrust::host_vector<int> counts_host(counts);
   std::vector<kv> path_lengths(counts_host.size());
   for (auto i = 0ull; i < counts_host.size(); i++) {
@@ -509,38 +502,6 @@ std::vector<size_t> FFDBinPackingEfficient(const IntVectorT& counts,
     int required_size = pair.second;
     bin_map[pair.first] = tree.GetFirstFitBin(required_size);
   }
-}
-
-template <typename IntVectorT>
-std::vector<size_t> FFDBinPacking(
-  const IntVectorT& counts, int bin_limit = 32) {
-  thrust::host_vector<int> counts_host(counts);
-  std::vector<kv> path_lengths(counts_host.size());
-  for (auto i = 0ull; i < counts_host.size(); i++) {
-    path_lengths[i] = {i, counts_host[i]};
-  }
-  std::sort(path_lengths.begin(), path_lengths.end(),
-    [&](const kv& a, const kv& b) {
-    std::greater<> op;
-    return op(a.second, b.second);
-  });
-
-  // map unique_id -> bin
-  std::vector<size_t> bin_map(counts_host.size());
-  std::vector<int> bin_capacities(path_lengths.size(), bin_limit);
-  for (auto pair : path_lengths) {
-    int new_size = pair.second;
-    for (auto j = 0ull; j < bin_capacities.size(); j++) {
-      int& capacity = bin_capacities[j];
-
-      if (capacity >= new_size) {
-        capacity -= new_size;
-        bin_map[pair.first] = j;
-        break;
-      }
-    }
-  }
-
   return bin_map;
 }
 
@@ -734,7 +695,6 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
   int_vector path_lengths;
   detail::GetPathLengths(deduplicated_paths, &path_lengths);
   size_vector device_bin_map;
-  printf("Packing algorithm %d\n",packing_algorithm);
   clock_t clock_begin = clock();
   if(packing_algorithm==0){
    device_bin_map = detail::NoBinPacking(path_lengths);

@@ -464,7 +464,7 @@ TEST(GPUTreeShap, FFDBinPacking) {
   counts[4] = 2;
   counts[5] = 2;
   counts[6] = 2;
-  auto bin_packing = gpu_treeshap::detail::FFDBinPacking(counts, 16);
+  auto bin_packing = gpu_treeshap::detail::FFDBinPackingEfficient(counts, 16);
   EXPECT_EQ(bin_packing[0], 0u);
   EXPECT_EQ(bin_packing[1], 1u);
   EXPECT_EQ(bin_packing[2], 1u);
