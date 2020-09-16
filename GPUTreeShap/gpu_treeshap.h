@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 #include <set>
+#include <numeric>
 
 namespace gpu_treeshap {
 /*! An element of a unique path through a decision tree. */
@@ -292,6 +293,7 @@ void GetBinSegments(const PathVectorT& paths, const SizeVectorT& bin_map,
       thrust::reduce(thrust::cuda::par(alloc), bin_map.begin(), bin_map.end(),
                      size_t(0), thrust::maximum<size_t>()) +
       1;
+  printf("Bins used %d\n",int(num_bins));
   bin_segments->resize(num_bins + 1, 0);
   auto counting = thrust::make_counting_iterator(0llu);
   auto d_paths = paths.data().get();
@@ -482,6 +484,15 @@ std::vector<size_t> NFBinPacking(
   return bin_map;
 }
 
+// No bin packing
+template <typename IntVectorT>
+std::vector<size_t> NoBinPacking(
+    const IntVectorT& counts, int bin_limit = 32) {
+  std::vector<size_t> bin_map(counts.size());
+  std::iota(bin_map.begin(), bin_map.end(), size_t(0));
+  return bin_map;
+}
+
 template <typename PathVectorT, typename LengthVectorT>
 void GetPathLengths(const PathVectorT& device_paths,
                           LengthVectorT* path_lengths) {
@@ -609,7 +620,7 @@ void ComputeBias(const PathVectorT& device_paths,
 template <typename DeviceAllocatorT = thrust::device_allocator<int>,
           typename DatasetT, typename PathIteratorT>
 void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
-                 size_t num_groups, float* phis_out) {
+                 size_t num_groups, float* phis_out, int packing_algorithm=3) {
   if (X.NumRows() == 0 || X.NumCols() == 0 || end - begin <= 0) return;
   using size_vector = thrust::device_vector<
       size_t, typename DeviceAllocatorT::template rebind<size_t>::other>;
@@ -639,7 +650,23 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                                                           &deduplicated_paths);
   int_vector path_lengths;
   detail::GetPathLengths(deduplicated_paths, &path_lengths);
-  size_vector device_bin_map = detail::BFDBinPacking(path_lengths);
+  size_vector device_bin_map;
+  printf("Packing algorithm %d\n",packing_algorithm);
+  clock_t clock_begin = clock();
+  if(packing_algorithm==0){
+   device_bin_map = detail::NoBinPacking(path_lengths);
+  }
+  if(packing_algorithm==1){
+   device_bin_map = detail::NFBinPacking(path_lengths);
+  }
+  if(packing_algorithm==2){
+   device_bin_map = detail::FFDBinPacking(path_lengths);
+  }
+  if(packing_algorithm==3){
+   device_bin_map = detail::BFDBinPacking(path_lengths);
+  }
+  clock_t clock_end = clock();
+  printf("Time: %f\n",(double)(clock_end - clock_begin) / CLOCKS_PER_SEC);
   detail::SortPaths<path_vector, size_vector, DeviceAllocatorT>(
       &deduplicated_paths, device_bin_map);
   size_vector device_bin_segments;

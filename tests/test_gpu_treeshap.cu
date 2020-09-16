@@ -466,18 +466,22 @@ TEST(GPUTreeShap, NFBinPacking) {
 }
 
 TEST(GPUTreeShap, FFDBinPacking) {
-  thrust::device_vector<int> counts(5);
-  counts[0] = 3;
-  counts[1] = 2;
-  counts[2] = 3;
-  counts[3] = 4;
-  counts[4] = 1;
-  auto bin_packing = gpu_treeshap::detail::FFDBinPacking(counts, 5);
-  EXPECT_EQ(bin_packing[0], 1u);
+  thrust::device_vector<int> counts(7);
+  counts[0] = 11;
+  counts[1] = 6;
+  counts[2] = 6;
+  counts[3] = 3;
+  counts[4] = 2;
+  counts[5] = 2;
+  counts[6] = 2;
+  auto bin_packing = gpu_treeshap::detail::FFDBinPacking(counts, 16);
+  EXPECT_EQ(bin_packing[0], 0u);
   EXPECT_EQ(bin_packing[1], 1u);
-  EXPECT_EQ(bin_packing[2], 2u);
+  EXPECT_EQ(bin_packing[2], 1u);
   EXPECT_EQ(bin_packing[3], 0u);
   EXPECT_EQ(bin_packing[4], 0u);
+  EXPECT_EQ(bin_packing[5], 1u);
+  EXPECT_EQ(bin_packing[6], 1u);
 }
 
 __global__ void TestContiguousGroup() {
