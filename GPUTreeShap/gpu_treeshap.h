@@ -719,6 +719,103 @@ inline __host__ __device__ double W(double s, double n) {
   return exp(lgamma(s + 1) - lgamma(n + 1) + lgamma(n - s));
 }
 
+struct CachedWeights
+{
+  float W_[33][33];
+
+  __device__ void Init()
+ {
+   
+    for (int i = threadIdx.x; i < 33 * 33; i += blockDim.x) {
+      auto s = i % 33;
+      auto n = i / 33;
+      if (n - s - 1 >= 0) {
+        W_[s][n] = W(s, n);
+      } else {
+        W_[s][n] = 0.0;
+      }
+    }
+    __syncthreads();
+ }
+  __device__ float Get(int s,int n)const 
+  {
+    return W_[s][n];
+  }
+};
+
+// Assign kNumCached words of shared memory to each warp
+template <size_t kNumCached, size_t kBlockSize,size_t kNumWarps=kBlockSize/32>
+struct CachedSplitEvaluation {
+  static const size_t kMaxElements=kNumCached;
+  // Shared memory storage
+  struct TempStorage {
+    uint32_t bit_vector_storage_[kNumWarps][kNumCached];
+  };
+  CachedSplitEvaluation() = default;
+  template <typename DatasetT,typename SplitConditionT>
+  __device__ CachedSplitEvaluation(TempStorage* temp_storage, DatasetT X,
+                                   size_t row_begin,
+                       const PathElement<SplitConditionT>& e,
+                       const ContiguousGroup& warp):warp_idx_(threadIdx.x /32)
+  { 
+
+    bit_vector_ = &temp_storage->bit_vector_storage_;
+    size_ = min(kNumCached, X.NumRows() - row_begin);
+
+    for(auto i = 0; i < size_; i++)
+    {
+      bool split_result = e.EvaluateSplit(X, row_begin + i);
+      (*bit_vector_)[warp_idx_][i] = warp.ballot(split_result);
+    }
+  }
+  __device__ size_t MaxElements()const 
+  {
+    return kNumCached;
+  }
+ __device__  size_t Size()const  { return size_; }
+
+ __device__  uint32_t GetPathEvaluations(int i, const ContiguousGroup& labelled_group)const 
+  {
+    return (*bit_vector_)[warp_idx_][i] & labelled_group.mask_;
+  }
+  // Get the split evaluation for just this thread
+ __device__  bool GetLocalEvaluation(int i, const ContiguousGroup& warp)const 
+  {
+   return (*bit_vector_)[warp_idx_][i] & (1 << warp.thread_rank());
+  }
+
+ private:
+  uint32_t(*bit_vector_)[kNumWarps][kNumCached];
+  size_t size_;
+  const int warp_idx_;
+};
+
+inline __device__ float Theorem1(bool x_split, uint32_t x_ballot, bool r_split,
+                                 uint32_t r_ballot,
+                                 const CachedWeights& weights, bool is_root,
+                                 const ContiguousGroup& labelled_group) {
+  assert(!is_root ||
+         (x_split == r_split));  // These should be the same for the root
+  uint32_t s = __popc(x_ballot & ~r_ballot);
+  uint32_t n = __popc(x_ballot ^ r_ballot);
+  float tmp = 0.0f;
+  if (x_split && !r_split) {
+    tmp += weights.Get(s - 1, n);
+  }
+  tmp -= weights.Get(s, n) * (r_split && !x_split);
+
+  // No foreground samples make it to this leaf, increment bias
+  if (is_root && s == 0) {
+    tmp += 1.0f;
+  }
+  // If neither foreground or background go down this path, ignore this
+  // path
+  bool reached_leaf = !labelled_group.ballot(!x_split && !r_split);
+  tmp *= reached_leaf;
+
+  return tmp;
+}
+
 template <typename DatasetT, size_t kBlockSize, size_t kRowsPerWarp,
           typename SplitConditionT>
 __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
@@ -727,20 +824,14 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
                              const size_t* bin_segments, size_t num_groups,
                              double* phis) {
   // Cache W coefficients
-  __shared__ float s_W[33][33];
-  for (int i = threadIdx.x; i < 33 * 33; i += kBlockSize) {
-    auto s = i % 33;
-    auto n = i / 33;
-    if (n - s - 1 >= 0) {
-      s_W[s][n] = W(s, n);
-    } else {
-      s_W[s][n] = 0.0;
-    }
-  }
+  __shared__ CachedWeights cached_w;
+  cached_w.Init();
+  using XCachedSplitEvaluationT = CachedSplitEvaluation<1, kBlockSize>;
+  using RCachedSplitEvaluationT = CachedSplitEvaluation<200, kBlockSize>;
+  __shared__ typename XCachedSplitEvaluationT::TempStorage temp_storage_x;
+  __shared__ typename RCachedSplitEvaluationT::TempStorage temp_storage_r;
 
-  __shared__ PathElement<SplitConditionT> s_elements[kBlockSize];
-  PathElement<SplitConditionT>& e = s_elements[threadIdx.x];
-
+  PathElement<SplitConditionT> e;
   size_t start_row, end_row;
   bool thread_active;
   ConfigureThread<DatasetT, kBlockSize, kRowsPerWarp>(
@@ -749,45 +840,49 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
 
   uint32_t mask = __ballot_sync(FULL_MASK, thread_active);
   if (!thread_active) return;
-
   auto labelled_group = active_labeled_partition(mask, e.path_idx);
+  auto warp = active_labeled_partition(mask, 0);
 
-  for (int64_t x_idx = start_row; x_idx < end_row; x_idx++) {
-    float result = 0.0f;
-    bool x_cond = e.EvaluateSplit(X, x_idx);
-    uint32_t x_ballot = labelled_group.ballot(x_cond);
-    for (int64_t r_idx = 0; r_idx < R.NumRows(); r_idx++) {
-      bool r_cond = e.EvaluateSplit(R, r_idx);
-      uint32_t r_ballot = labelled_group.ballot(r_cond);
-      assert(!e.IsRoot() ||
-             (x_cond == r_cond));  // These should be the same for the root
-      uint32_t s = __popc(x_ballot & ~r_ballot);
-      uint32_t n = __popc(x_ballot ^ r_ballot);
-      float tmp = 0.0f;
-      // Theorem 1
-      if (x_cond && !r_cond) {
-        tmp += s_W[s - 1][n];
+  for (int64_t x_batch_start = start_row; x_batch_start < end_row;
+       x_batch_start += XCachedSplitEvaluationT::kMaxElements) {
+    XCachedSplitEvaluationT cached_x_splits(&temp_storage_x, X, x_batch_start, e,
+                                           warp);
+    int64_t x_batch_size = cached_x_splits.Size();
+
+    for (int64_t x_idx = x_batch_start; x_idx < x_batch_start + x_batch_size;
+         x_idx++) {
+      float result = 0.0f;
+      bool x_split =
+          cached_x_splits.GetLocalEvaluation(x_idx - x_batch_start, warp);
+      uint32_t x_ballot = cached_x_splits.GetPathEvaluations(
+          x_idx - x_batch_start, labelled_group);
+      for (int64_t r_batch_start = 0; r_batch_start < R.NumRows();
+           r_batch_start += RCachedSplitEvaluationT::kMaxElements) {
+        RCachedSplitEvaluationT cached_r_splits(&temp_storage_r, R,
+                                               r_batch_start, e, warp);
+        int r_batch_size = cached_r_splits.Size();
+        //for (int64_t r_idx = r_batch_start;
+             //r_idx < r_batch_start + r_batch_size; r_idx++) {
+#pragma unroll 8
+          for(int  i = 0; i < r_batch_size; i++){
+          bool r_split =
+              cached_r_splits.GetLocalEvaluation(i, warp);
+          uint32_t r_ballot = cached_r_splits.GetPathEvaluations(i
+              , labelled_group);
+          result += Theorem1(x_split, x_ballot, r_split, r_ballot, cached_w,
+                             e.IsRoot(), labelled_group);
+        }
       }
-      tmp -= s_W[s][n] * (r_cond && !x_cond);
 
-      // No foreground samples make it to this leaf, increment bias
-      if (e.IsRoot() && s == 0) {
-        tmp += 1.0f;
+      if (result != 0.0) {
+        result /= R.NumRows();
+
+        // Root writes bias
+        auto feature = e.IsRoot() ? X.NumCols() : e.feature_idx;
+        atomicAddDouble(
+            &phis[IndexPhi(x_idx, num_groups, e.group, X.NumCols(), feature)],
+            result * e.v);
       }
-      // If neither foreground or background go down this path, ignore this path
-      bool reached_leaf = !labelled_group.ballot(!x_cond && !r_cond);
-      tmp *= reached_leaf;
-      result += tmp;
-    }
-
-    if (result != 0.0) {
-      result /= R.NumRows();
-
-      // Root writes bias
-      auto feature = e.IsRoot() ? X.NumCols() : e.feature_idx;
-      atomicAddDouble(
-          &phis[IndexPhi(x_idx, num_groups, e.group, X.NumCols(), feature)],
-          result * e.v);
     }
   }
 }
