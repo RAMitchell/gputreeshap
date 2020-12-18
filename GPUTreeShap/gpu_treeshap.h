@@ -705,14 +705,6 @@ void ComputeShapTaylorInteractions(
 }
 
 
-inline __host__ __device__ int64_t Factorial(int64_t x) {
-  int64_t y = 1;
-  for (auto i = 2; i <= x; i++) {
-    y *= i;
-  }
-  return y;
-}
-
 // Compute factorials in log space using lgamma to avoid overflow
 inline __host__ __device__ double W(double s, double n) {
   assert(n - s - 1 >= 0);
@@ -813,6 +805,102 @@ void ComputeShapInterventional(
           X, R, bins_per_row, path_elements.data().get(),
           bin_segments.data().get(), num_groups, phis);
 }
+
+inline __host__ __device__ bool CheckBit(uint64_t x, int bit) {
+  return x & (1 << bit);
+}
+
+template <typename DatasetT, size_t kBlockSize, size_t kRowsPerWarp,
+  typename SplitConditionT>
+__global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
+  ShapExactKernel(DatasetT X, size_t bins_per_row,
+    const PathElement<SplitConditionT>* path_elements,
+    const size_t* bin_segments, size_t num_groups, double*  samples) {
+  PathElement<SplitConditionT> e;
+  size_t start_row, end_row;
+  bool thread_active;
+  ConfigureThread<DatasetT, kBlockSize, kRowsPerWarp>(
+    X, bins_per_row, path_elements, bin_segments, &start_row, &end_row, &e,
+    &thread_active);
+  uint32_t mask = __ballot_sync(FULL_MASK, thread_active);
+  if (!thread_active) return;
+
+  float zero_fraction = e.zero_fraction;
+  auto labelled_group = active_labeled_partition(mask, e.path_idx);
+  uint64_t num_feature_combinations = 1 << X.NumCols();
+
+  for (int64_t row_idx = start_row; row_idx < end_row; row_idx++) {
+    float one_fraction = e.EvaluateSplit(X, row_idx);
+    // s is the set of active features
+    // we enumerate all 2^n possible sets
+    for (uint64_t s = 0; s < num_feature_combinations; s++) {
+      bool feature_active = e.IsRoot() || CheckBit(s, e.feature_idx);
+      float reduce_input = feature_active ? one_fraction : zero_fraction;
+      float reduce =
+          labelled_group.reduce(reduce_input, thrust::multiplies<float>());
+      if (e.IsRoot()) {
+        int64_t shape[] = {X.NumRows(), num_groups, num_feature_combinations};
+        int64_t indices[] = {row_idx,e.group,s};
+        size_t out_idx = TensorIdxToFlatIdx(shape,indices);
+        atomicAddDouble(&samples[out_idx],
+                        reduce * e.v);
+      }
+    }
+  }
+}
+
+template <typename DatasetT, typename SizeTAllocatorT, typename PathAllocatorT,
+  typename SplitConditionT>
+void ComputeShapExact(
+    DatasetT X, 
+    const thrust::device_vector<size_t, SizeTAllocatorT>& bin_segments,
+    const thrust::device_vector<PathElement<SplitConditionT>, PathAllocatorT>&
+    path_elements,
+    size_t num_groups, double* phis) {
+  size_t bins_per_row = bin_segments.size() - 1;
+  const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
+  const int warps_per_block = kBlockThreads / 32;
+  const int kRowsPerWarp = 1;
+  size_t warps_needed = bins_per_row * DivRoundUp(X.NumRows(), kRowsPerWarp);
+
+  const uint32_t grid_size = DivRoundUp(warps_needed, warps_per_block);
+
+  using double_vector = detail::RebindVector<double, PathAllocatorT>;
+  size_t num_feature_combinations = 1 << X.NumCols();
+  double_vector samples(num_feature_combinations * X.NumRows() * num_groups,
+                        0.0);
+
+  ShapExactKernel<DatasetT, kBlockThreads, kRowsPerWarp>
+    <<<grid_size, kBlockThreads>>>(
+      X, bins_per_row, path_elements.data().get(),
+      bin_segments.data().get(), num_groups, samples.data().get());
+
+  auto d_samples = samples.data().get();
+  thrust::for_each_n(
+      thrust::make_counting_iterator(0ll), samples.size(),
+      [=] __device__(int64_t idx) {
+        int64_t indices[3];
+        int64_t shape[] = {X.NumRows(), num_groups, num_feature_combinations};
+        FlatIdxToTensorIdx(idx, shape, indices);
+        size_t row_idx = indices[0];
+        size_t group = indices[1];
+
+        int64_t s = indices[2];
+        double sample = d_samples[idx];
+        for (auto i = 0ull; i < X.NumCols(); i++) {
+          if (CheckBit(s, i)) {
+            double val = W(__popc(s) - 1, X.NumCols()) * sample;
+            atomicAddDouble(
+                phis + IndexPhi(row_idx, num_groups, group, X.NumCols(), i), val);
+          } else {
+            double val = -W(__popc(s), X.NumCols()) * sample;
+            atomicAddDouble(
+                phis + IndexPhi(row_idx, num_groups, group, X.NumCols(), i), val);
+          }
+        }
+      });
+}
+
 
 template <typename PathVectorT, typename SizeVectorT, typename DeviceAllocatorT>
 void GetBinSegments(const PathVectorT& paths, const SizeVectorT& bin_map,
@@ -1493,6 +1581,61 @@ void GPUTreeShapInterventional(DatasetT X, DatasetT R, PathIteratorT begin,
   detail::ComputeShapInterventional(X, R, device_bin_segments,
                                     deduplicated_paths, num_groups,
                                     temp_phi.data().get());
+  thrust::copy(temp_phi.begin(), temp_phi.end(), phis_begin);
+}
+
+template <typename DeviceAllocatorT = thrust::device_allocator<int>,
+  typename DatasetT, typename PathIteratorT, typename PhiIteratorT>
+void GPUTreeShapExact(DatasetT X, PathIteratorT begin,
+    PathIteratorT end, size_t num_groups,
+    PhiIteratorT phis_begin, PhiIteratorT phis_end) {
+  if (X.NumRows() == 0 || X.NumCols() == 0 || end - begin <= 0) return;
+
+  if (X.NumCols() > 10) {
+    throw std::invalid_argument(
+        "Exact algorithm is exponential time and should not be used with more "
+        "than 10 features.");
+  }
+
+  if (size_t(phis_end - phis_begin) <
+    X.NumRows() * (X.NumCols() + 1) * num_groups) {
+    throw std::invalid_argument(
+      "phis_out must be at least of size X.NumRows() * (X.NumCols() + 1) * "
+      "num_groups");
+  }
+
+  using size_vector = detail::RebindVector<size_t, DeviceAllocatorT>;
+  using double_vector = detail::RebindVector<double, DeviceAllocatorT>;
+  using path_vector = detail::RebindVector<
+    typename std::iterator_traits<PathIteratorT>::value_type,
+    DeviceAllocatorT>;
+  using split_condition =
+    typename std::iterator_traits<PathIteratorT>::value_type::split_type;
+
+  // Compute the global bias
+  double_vector temp_phi(phis_end - phis_begin, 0.0);
+  path_vector device_paths(begin, end);
+  double_vector bias(num_groups, 0.0);
+  detail::ComputeBias<path_vector, double_vector, DeviceAllocatorT,
+                      split_condition>(device_paths, &bias);
+  auto d_bias = bias.data().get();
+  auto d_temp_phi = temp_phi.data().get();
+  thrust::for_each_n(thrust::make_counting_iterator(0llu),
+                     X.NumRows() * num_groups, [=] __device__(size_t idx) {
+                       size_t group = idx % num_groups;
+                       size_t row_idx = idx / num_groups;
+                       d_temp_phi[IndexPhi(row_idx, num_groups, group,
+                                           X.NumCols(), X.NumCols())] +=
+                           d_bias[group];
+                     });
+
+  path_vector deduplicated_paths;
+  size_vector device_bin_segments;
+  detail::PreprocessPaths<DeviceAllocatorT, split_condition>(
+    &device_paths, &deduplicated_paths, &device_bin_segments);
+  detail::ComputeShapExact(X, device_bin_segments,
+    deduplicated_paths, num_groups,
+    temp_phi.data().get());
   thrust::copy(temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 }  // namespace gpu_treeshap

@@ -22,9 +22,15 @@
 #include <vector>
 #include "gtest/gtest.h"
 #include "tests/test_utils.h"
-#include "../GPUTreeShap/gpu_treeshap.h"
 
 using namespace gpu_treeshap;  // NOLINT
+
+#define EXPECT_THROW_CONTAINS_MESSAGE(stmt, etype, whatstring)             \
+  EXPECT_THROW(try { stmt; } catch (const etype& ex) {                     \
+    EXPECT_NE(std::string(ex.what()).find(whatstring), std::string::npos); \
+    throw;                                                                 \
+  },                                                                       \
+               etype)
 
 class ParameterisedModelTest
     : public ::testing::TestWithParam<
@@ -145,6 +151,36 @@ TEST_P(ParameterisedModelTest, ShapSumInterventional) {
   }
 }
 
+TEST_P(ParameterisedModelTest, ShapSumExact) {
+  if (num_features > 10) {
+    EXPECT_THROW_CONTAINS_MESSAGE(
+        GPUTreeShapExact(X, model.begin(), model.end(), num_groups,
+                         phis.begin(), phis.end()),
+        std::invalid_argument,
+        "Exact algorithm is exponential time and should not be used with more "
+        "than 10 features.");
+    return;
+  }
+  GPUTreeShapExact(X, model.begin(), model.end(), num_groups, phis.begin(),
+                   phis.end());
+  thrust::host_vector<float> result(phis);
+  std::vector<float> tmp(result.begin(), result.end());
+  std::vector<float> sum(num_rows * num_groups);
+  for (auto i = 0ull; i < num_rows; i++) {
+    for (auto j = 0ull; j < num_features + 1; j++) {
+      for (auto group = 0ull; group < num_groups; group++) {
+        size_t result_index = IndexPhi(i, num_groups, group, num_features, j);
+        sum[i * num_groups + group] += result[result_index];
+      }
+    }
+  }
+  for (auto i = 0ull; i < sum.size(); i++) {
+    ASSERT_NEAR(sum[i], margin[i], 1e-3);
+  }
+}
+
+
+
 std::string PrintTestName(
     const testing::TestParamInfo<ParameterisedModelTest::ParamType>& info) {
   std::string name = "nrow" + std::to_string(std::get<0>(info.param)) + "_";
@@ -170,12 +206,6 @@ INSTANTIATE_TEST_CASE_P(ShapInstantiation, ParameterisedModelTest,
                                          testing::ValuesIn(test_num_paths)),
                         PrintTestName);
 
-#define EXPECT_THROW_CONTAINS_MESSAGE(stmt, etype, whatstring)             \
-  EXPECT_THROW(try { stmt; } catch (const etype& ex) {                     \
-    EXPECT_NE(std::string(ex.what()).find(whatstring), std::string::npos); \
-    throw;                                                                 \
-  },                                                                       \
-               etype)
 
 class APITest : public ::testing::Test {
  protected:
@@ -913,4 +943,38 @@ TEST(GPUTreeShap, InterventionalBasic) {
   ASSERT_FLOAT_EQ(result[1], -2.25f);
   ASSERT_FLOAT_EQ(result[2], 0.25f);
   ASSERT_FLOAT_EQ(result[3], 8.0f);
+}
+
+TEST(GPUTreeShap, ExactBasic) {
+  const float inf = std::numeric_limits<float>::infinity();
+  std::vector<PathElement<XgboostSplitCondition>> path{
+      {0, -1, 0, {-inf, inf, false}, 1.0f, 0.5f},
+      {0, 0, 0, {0.5f, inf, false}, 0.6f, 0.5f},
+      {0, 1, 0, {0.5f, inf, false}, 2.0f / 3, 0.5f},
+      {0, 2, 0, {0.5f, inf, false}, 0.5f, 0.5f},
+      {1, -1, 0, {-inf, 0.0f, false}, 1.0f, 1.0f},
+      {1, 0, 0, {0.5f, inf, false}, 0.6f, 1.0f},
+      {1, 1, 0, {0.5f, inf, false}, 2.0f / 3, 1.0f},
+      {1, 2, 0, {-inf, 0.5f, false}, 0.5f, 1.0f},
+      {2, -1, 0, {-inf, 0.0f, false}, 1.0f, -1},
+      {2, 0, 0, {0.5f, inf, false}, 0.6f, -1.0f},
+      {2, 1, 0, {-inf, 0.5f, false}, 1.0f / 3, -1.0f},
+      {3, -1, 0, {-inf, 0.0f, false}, 1.0f, -1.0f},
+      {3, 0, 0, {-inf, 0.5f, false}, 0.4f, -1.0f}};
+  thrust::device_vector<float> data =
+      std::vector<float>({1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f});
+  DenseDatasetWrapper X(data.data().get(), 2, 3);
+  thrust::device_vector<float> phis(X.NumRows() * (X.NumCols() + 1));
+  GPUTreeShapExact(X, path.begin(), path.end(), 1, phis.begin(), phis.end());
+  thrust::host_vector<float> result(phis);
+  // First instance
+  EXPECT_NEAR(result[0], 0.6277778f, 1e-5);
+  EXPECT_NEAR(result[1], 0.5027776f, 1e-5);
+  EXPECT_NEAR(result[2], 0.1694444f, 1e-5);
+  EXPECT_NEAR(result[3], -0.3f, 1e-5);
+  // Second instance
+  EXPECT_NEAR(result[4], 0.24444449f, 1e-5);
+  EXPECT_NEAR(result[5], -1.005555f, 1e-5);
+  EXPECT_NEAR(result[6], 0.0611111f, 1e-5);
+  EXPECT_NEAR(result[7], -0.3f, 1e-5);
 }
