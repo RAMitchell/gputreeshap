@@ -171,7 +171,8 @@ private:
   ptr_t ptr;
 
 public:
-  Vector(const ExecutionPolicyT &policy, std::size_t n) : policy(policy), n(n) {
+  Vector(const ExecutionPolicyT &policy, std::size_t n = 0)
+      : policy(policy), n(n) {
     ptr = thrust::malloc<T>(policy, n);
   }
   Vector(const ExecutionPolicyT &policy, std::size_t n, T val)
@@ -188,8 +189,12 @@ public:
   ~Vector() { thrust::free(policy, ptr); }
   ptr_t begin() { return ptr; }
   ptr_t end() { return ptr + n; }
+  ptr_t begin() const { return ptr; }
+  ptr_t end() const { return ptr + n; }
   ptr_t data() { return ptr; }
   std::size_t size() { return n; }
+
+  void resize(std::size_t n) {}
 };
 
 // Shorthand for creating a device vector with an appropriate allocator type
@@ -846,27 +851,23 @@ void ComputeShapInterventional(
           bin_segments.data().get(), num_groups, phis);
 }
 
-template <typename PathVectorT, typename SizeVectorT, typename DeviceAllocatorT>
-void GetBinSegments(const PathVectorT &paths, const SizeVectorT &bin_map,
-                    SizeVectorT *bin_segments) {
-  DeviceAllocatorT alloc;
-  size_t num_bins =
-      thrust::reduce(thrust::cuda::par(alloc), bin_map.begin(), bin_map.end(),
-                     size_t(0), thrust::maximum<size_t>()) +
-      1;
+template <typename PathVectorT, typename SizeVectorT, typename DeviceAllocatorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void GetBinSegments(const ExecutionPolicyT &policy, const PathVectorT &paths,
+                    const SizeVectorT &bin_map, SizeVectorT *bin_segments) {
+  size_t num_bins = thrust::reduce(policy, bin_map.begin(), bin_map.end(),
+                                   size_t(0), thrust::maximum<size_t>()) +
+                    1;
   bin_segments->resize(num_bins + 1, 0);
-  auto counting = thrust::make_counting_iterator(0llu);
-  auto d_paths = paths.data().get();
-  auto d_bin_segments = bin_segments->data().get();
   auto d_bin_map = bin_map.data();
-  thrust::for_each_n(counting, paths.size(), [=] __device__(size_t idx) {
-    auto path_idx = d_paths[idx].path_idx;
-    atomicAdd(reinterpret_cast<unsigned long long *>(d_bin_segments) + // NOLINT
-                  d_bin_map[path_idx],
-              1);
-  });
-  thrust::exclusive_scan(thrust::cuda::par(alloc), bin_segments->begin(),
-                         bin_segments->end(), bin_segments->begin());
+  auto constant = thrust::make_constant_iterator(1llu);
+  auto discard = thrust::make_discard_iterator();
+  thrust::reduce_by_key(policy, paths.begin(), paths.end(), constant, discard,
+                        bin_segments->begin(), [=] __device__(auto a, auto b) {
+                          return d_bin_map[a.path_idx] == d_bin_map[b.path_idx];
+                        });
+  thrust::exclusive_scan(policy, bin_segments->begin(), bin_segments->end(),
+                         bin_segments->begin());
 }
 
 struct DeduplicateKeyTransformOp {
@@ -892,9 +893,8 @@ public:
 template <typename PathVectorT, typename DeviceAllocatorT,
           typename SplitConditionT,
           typename ExecutionPolicyT = decltype(thrust::device)>
-void DeduplicatePaths(PathVectorT *device_paths,
-                      PathVectorT *deduplicated_paths,
-                      const ExecutionPolicyT &policy = thrust::device) {
+void DeduplicatePaths(const ExecutionPolicyT &policy, PathVectorT *device_paths,
+                      PathVectorT *deduplicated_paths) {
   // Sort by feature
   thrust::sort(policy, device_paths->begin(), device_paths->end(),
                [=] __device__(const PathElement<SplitConditionT> &a,
@@ -917,9 +917,9 @@ void DeduplicatePaths(PathVectorT *device_paths,
       device_paths->begin(), DeduplicateKeyTransformOp());
   thrust::equal_to<thrust::pair<size_t, int64_t>> key_compare;
   auto end = thrust::reduce_by_key(
-       policy, key_transform,
-      key_transform + device_paths->size(), device_paths->begin(),
-      thrust::make_discard_iterator(), deduplicated_paths->begin(), key_compare,
+      policy, key_transform, key_transform + device_paths->size(),
+      device_paths->begin(), thrust::make_discard_iterator(),
+      deduplicated_paths->begin(), key_compare,
       [=] __device__(PathElement<SplitConditionT> a,
                      const PathElement<SplitConditionT> &b) {
         // Combine duplicate features
@@ -934,8 +934,8 @@ void DeduplicatePaths(PathVectorT *device_paths,
 template <typename PathVectorT, typename SplitConditionT, typename SizeVectorT,
           typename DeviceAllocatorT,
           typename ExecutionPolicyT = decltype(thrust::device)>
-void SortPaths(PathVectorT *paths, const SizeVectorT &bin_map,
-                      const ExecutionPolicyT &policy = thrust::device) {
+void SortPaths(const ExecutionPolicyT &policy, PathVectorT *paths,
+               const SizeVectorT &bin_map) {
   auto d_bin_map = bin_map.data();
   thrust::sort(policy, paths->begin(), paths->end(),
                [=] __device__(const PathElement<SplitConditionT> &a,
@@ -976,7 +976,7 @@ struct BFDCompare {
 template <typename IntVectorT>
 std::vector<size_t> BFDBinPacking(const IntVectorT &counts,
                                   int bin_limit = 32) {
-  thrust::host_vector<int> counts_host(counts);
+  thrust::host_vector<int> counts_host(counts.begin(),counts.end());
   std::vector<kv> path_lengths(counts_host.size());
   for (auto i = 0ull; i < counts_host.size(); i++) {
     path_lengths[i] = {i, counts_host[i]};
@@ -1013,20 +1013,17 @@ std::vector<size_t> BFDBinPacking(const IntVectorT &counts,
 }
 
 template <typename DeviceAllocatorT, typename SplitConditionT,
-          typename PathVectorT, typename LengthVectorT>
-void GetPathLengths(const PathVectorT &device_paths,
+          typename PathVectorT, typename LengthVectorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void GetPathLengths(const ExecutionPolicyT &policy,
+                    const PathVectorT &device_paths,
                     LengthVectorT *path_lengths) {
-  path_lengths->resize(
-      static_cast<PathElement<SplitConditionT>>(device_paths.back()).path_idx +
-          1,
-      0);
-  auto counting = thrust::make_counting_iterator(0llu);
-  auto d_paths = device_paths.data().get();
-  auto d_lengths = path_lengths->data().get();
-  thrust::for_each_n(counting, device_paths.size(), [=] __device__(size_t idx) {
-    auto path_idx = d_paths[idx].path_idx;
-    atomicAdd(d_lengths + path_idx, 1ull);
-  });
+  auto constant = thrust::make_constant_iterator(1llu);
+  auto discard = thrust::make_discard_iterator();
+  thrust::reduce_by_key(
+      policy, device_paths.begin(), device_paths.end(), constant, discard,
+      path_lengths->begin(),
+      [=] __device__(auto a, auto b) { return a.path_idx == b.path_idx; });
 }
 
 struct PathTooLongOp {
@@ -1043,14 +1040,14 @@ template <typename SplitConditionT> struct IncorrectVOp {
 };
 
 template <typename DeviceAllocatorT, typename SplitConditionT,
-          typename PathVectorT, typename LengthVectorT>
-void ValidatePaths(const PathVectorT &device_paths,
+          typename PathVectorT, typename LengthVectorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void ValidatePaths(const ExecutionPolicyT &policy,
+                   const PathVectorT &device_paths,
                    const LengthVectorT &path_lengths) {
-  DeviceAllocatorT alloc;
   PathTooLongOp too_long_op;
-  auto invalid_length =
-      thrust::any_of(thrust::cuda::par(alloc), path_lengths.begin(),
-                     path_lengths.end(), too_long_op);
+  auto invalid_length = thrust::any_of(policy, path_lengths.begin(),
+                                       path_lengths.end(), too_long_op);
 
   if (invalid_length) {
     throw std::invalid_argument("Tree depth must be < 32");
@@ -1058,9 +1055,8 @@ void ValidatePaths(const PathVectorT &device_paths,
 
   IncorrectVOp<SplitConditionT> incorrect_v_op{device_paths.data().get()};
   auto counting = thrust::counting_iterator<size_t>(0);
-  auto incorrect_v =
-      thrust::any_of(thrust::cuda::par(alloc), counting + 1,
-                     counting + device_paths.size(), incorrect_v_op);
+  auto incorrect_v = thrust::any_of(
+      policy, counting + 1, counting + device_paths.size(), incorrect_v_op);
 
   if (incorrect_v) {
     throw std::invalid_argument(
@@ -1069,23 +1065,28 @@ void ValidatePaths(const PathVectorT &device_paths,
 }
 
 template <typename DeviceAllocatorT, typename SplitConditionT,
-          typename PathVectorT, typename SizeVectorT>
+          typename PathVectorT, typename SizeVectorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
 void PreprocessPaths(PathVectorT *device_paths, PathVectorT *deduplicated_paths,
-                     SizeVectorT *bin_segments) {
+                     SizeVectorT *bin_segments,
+                     const ExecutionPolicyT &policy = thrust::device) {
   // Sort paths by length and feature
   detail::DeduplicatePaths<PathVectorT, DeviceAllocatorT, SplitConditionT>(
-      device_paths, deduplicated_paths);
-  using int_vector = RebindVector<int, DeviceAllocatorT>;
-  int_vector path_lengths;
-  detail::GetPathLengths<DeviceAllocatorT, SplitConditionT>(*deduplicated_paths,
-                                                            &path_lengths);
+      policy, device_paths, deduplicated_paths);
+  auto num_paths =
+      static_cast<PathElement<SplitConditionT>>(device_paths->back()).path_idx +
+      1;
+  Vector<int, ExecutionPolicyT> path_lengths(policy, num_paths, 0);
+  detail::GetPathLengths<DeviceAllocatorT, SplitConditionT>(
+      policy, *deduplicated_paths, &path_lengths);
   SizeVectorT device_bin_map = detail::BFDBinPacking(path_lengths);
-  ValidatePaths<DeviceAllocatorT, SplitConditionT>(*deduplicated_paths,
-                                                   path_lengths);
+  detail::ValidatePaths<DeviceAllocatorT, SplitConditionT>(
+      policy, *deduplicated_paths, path_lengths);
   detail::SortPaths<PathVectorT, SplitConditionT, SizeVectorT,
-                    DeviceAllocatorT>(deduplicated_paths, device_bin_map);
+                    DeviceAllocatorT>(policy, deduplicated_paths,
+                                      device_bin_map);
   detail::GetBinSegments<PathVectorT, SizeVectorT, DeviceAllocatorT>(
-      *deduplicated_paths, device_bin_map, bin_segments);
+      policy, *deduplicated_paths, device_bin_map, bin_segments);
 }
 
 struct PathIdxTransformOp {
