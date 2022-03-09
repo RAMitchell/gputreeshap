@@ -161,11 +161,12 @@ namespace detail {
 // Convenience vector class using an execution policy
 template <typename T, typename ExecutionPolicyT> class Vector {
 private:
-  using value_t=T;
-  //using ptr_t=thrust::pointer<T,thrust::execution_policy<ExecutionPolicyT>>;
+  using value_t = T;
+  // using ptr_t=thrust::pointer<T,thrust::execution_policy<ExecutionPolicyT>>;
 
   const ExecutionPolicyT &policy;
-  using ptr_t = decltype(thrust::malloc<T>(std::declval<ExecutionPolicyT>(), std::declval<std::size_t >()));
+  using ptr_t = decltype(thrust::malloc<T>(std::declval<ExecutionPolicyT>(),
+                                           std::declval<std::size_t>()));
   std::size_t n;
   ptr_t ptr;
 
@@ -188,7 +189,7 @@ public:
   ptr_t begin() { return ptr; }
   ptr_t end() { return ptr + n; }
   ptr_t data() { return ptr; }
-  std::size_t size(){return n;}
+  std::size_t size() { return n; }
 };
 
 // Shorthand for creating a device vector with an appropriate allocator type
@@ -889,13 +890,13 @@ public:
 };
 
 template <typename PathVectorT, typename DeviceAllocatorT,
-          typename SplitConditionT>
+          typename SplitConditionT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
 void DeduplicatePaths(PathVectorT *device_paths,
-                      PathVectorT *deduplicated_paths) {
-  DeviceAllocatorT alloc;
+                      PathVectorT *deduplicated_paths,
+                      const ExecutionPolicyT &policy = thrust::device) {
   // Sort by feature
-  thrust::sort(thrust::cuda::par(alloc), device_paths->begin(),
-               device_paths->end(),
+  thrust::sort(policy, device_paths->begin(), device_paths->end(),
                [=] __device__(const PathElement<SplitConditionT> &a,
                               const PathElement<SplitConditionT> &b) {
                  if (a.path_idx < b.path_idx)
@@ -912,45 +913,31 @@ void DeduplicatePaths(PathVectorT *device_paths,
 
   deduplicated_paths->resize(device_paths->size());
 
-  using Pair = thrust::pair<size_t, int64_t>;
   auto key_transform = thrust::make_transform_iterator(
       device_paths->begin(), DeduplicateKeyTransformOp());
+  thrust::equal_to<thrust::pair<size_t, int64_t>> key_compare;
+  auto end = thrust::reduce_by_key(
+       policy, key_transform,
+      key_transform + device_paths->size(), device_paths->begin(),
+      thrust::make_discard_iterator(), deduplicated_paths->begin(), key_compare,
+      [=] __device__(PathElement<SplitConditionT> a,
+                     const PathElement<SplitConditionT> &b) {
+        // Combine duplicate features
+        a.split_condition.Merge(b.split_condition);
+        a.zero_fraction *= b.zero_fraction;
+        return a;
+      });
 
-  thrust::device_vector<size_t> d_num_runs_out(1);
-  size_t *h_num_runs_out;
-  CheckCuda(cudaMallocHost(&h_num_runs_out, sizeof(size_t)));
-
-  auto combine = [] __device__(PathElement<SplitConditionT> a,
-                               PathElement<SplitConditionT> b) {
-    // Combine duplicate features
-    a.split_condition.Merge(b.split_condition);
-    a.zero_fraction *= b.zero_fraction;
-    return a;
-  }; // NOLINT
-  size_t temp_size = 0;
-  CheckCuda(cub::DeviceReduce::ReduceByKey(
-      nullptr, temp_size, key_transform, DiscardOverload<Pair>(),
-      device_paths->begin(), deduplicated_paths->begin(),
-      d_num_runs_out.begin(), combine, device_paths->size()));
-  using TempAlloc = RebindVector<char, DeviceAllocatorT>;
-  TempAlloc tmp(temp_size);
-  CheckCuda(cub::DeviceReduce::ReduceByKey(
-      tmp.data().get(), temp_size, key_transform, DiscardOverload<Pair>(),
-      device_paths->begin(), deduplicated_paths->begin(),
-      d_num_runs_out.begin(), combine, device_paths->size()));
-
-  CheckCuda(cudaMemcpy(h_num_runs_out, d_num_runs_out.data().get(),
-                       sizeof(size_t), cudaMemcpyDeviceToHost));
-  deduplicated_paths->resize(*h_num_runs_out);
-  CheckCuda(cudaFreeHost(h_num_runs_out));
+  deduplicated_paths->resize(end.second - deduplicated_paths->begin());
 }
 
 template <typename PathVectorT, typename SplitConditionT, typename SizeVectorT,
-          typename DeviceAllocatorT>
-void SortPaths(PathVectorT *paths, const SizeVectorT &bin_map) {
+          typename DeviceAllocatorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void SortPaths(PathVectorT *paths, const SizeVectorT &bin_map,
+                      const ExecutionPolicyT &policy = thrust::device) {
   auto d_bin_map = bin_map.data();
-  DeviceAllocatorT alloc;
-  thrust::sort(thrust::cuda::par(alloc), paths->begin(), paths->end(),
+  thrust::sort(policy, paths->begin(), paths->end(),
                [=] __device__(const PathElement<SplitConditionT> &a,
                               const PathElement<SplitConditionT> &b) {
                  size_t a_bin = d_bin_map[a.path_idx];
@@ -1022,63 +1009,6 @@ std::vector<size_t> BFDBinPacking(const IntVectorT &counts,
     }
   }
 
-  return bin_map;
-}
-
-// First Fit Decreasing bin packing
-// Inefficient O(n^2) implementation
-template <typename IntVectorT>
-std::vector<size_t> FFDBinPacking(const IntVectorT &counts,
-                                  int bin_limit = 32) {
-  thrust::host_vector<int> counts_host(counts);
-  std::vector<kv> path_lengths(counts_host.size());
-  for (auto i = 0ull; i < counts_host.size(); i++) {
-    path_lengths[i] = {i, counts_host[i]};
-  }
-  std::sort(path_lengths.begin(), path_lengths.end(),
-            [&](const kv &a, const kv &b) {
-              std::greater<> op;
-              return op(a.second, b.second);
-            });
-
-  // map unique_id -> bin
-  std::vector<size_t> bin_map(counts_host.size());
-  std::vector<int> bin_capacities(path_lengths.size(), bin_limit);
-  for (auto pair : path_lengths) {
-    int new_size = pair.second;
-    for (auto j = 0ull; j < bin_capacities.size(); j++) {
-      int &capacity = bin_capacities[j];
-
-      if (capacity >= new_size) {
-        capacity -= new_size;
-        bin_map[pair.first] = j;
-        break;
-      }
-    }
-  }
-
-  return bin_map;
-}
-
-// Next Fit bin packing
-// O(n) implementation
-template <typename IntVectorT>
-std::vector<size_t> NFBinPacking(const IntVectorT &counts, int bin_limit = 32) {
-  thrust::host_vector<int> counts_host(counts);
-  std::vector<size_t> bin_map(counts_host.size());
-  size_t current_bin = 0;
-  int current_capacity = bin_limit;
-  for (auto i = 0ull; i < counts_host.size(); i++) {
-    int new_size = counts_host[i];
-    size_t path_idx = i;
-    if (new_size <= current_capacity) {
-      current_capacity -= new_size;
-      bin_map[path_idx] = current_bin;
-    } else {
-      current_capacity = bin_limit - new_size;
-      bin_map[path_idx] = ++current_bin;
-    }
-  }
   return bin_map;
 }
 
@@ -1179,9 +1109,6 @@ struct BiasTransformOp {
   }
 };
 
-template <typename R, typename... Args> R return_type_of(R (*)(Args...));
-
-
 // While it is possible to compute bias in the primary kernel, we do it here
 // using double precision to avoid numerical stability issues
 template <typename PathVectorT, typename DoubleVectorT,
@@ -1192,9 +1119,9 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
   using double_vector = thrust::device_vector<
       double, typename DeviceAllocatorT::template rebind<double>::other>;
 
-using path_t=typename PathVectorT::value_type;
-  Vector<path_t,ExecutionPolicyT> sorted_paths(policy, device_paths.begin(),
-                                   device_paths.end());
+  using path_t = typename PathVectorT::value_type;
+  Vector<path_t, ExecutionPolicyT> sorted_paths(policy, device_paths.begin(),
+                                                device_paths.end());
   // Make sure groups are contiguous
   thrust::sort(policy, sorted_paths.begin(), sorted_paths.end(),
                [=] __device__(const PathElement<SplitConditionT> &a,
@@ -1214,7 +1141,7 @@ using path_t=typename PathVectorT::value_type;
   // Combine zero fraction for all paths
   auto path_key = thrust::make_transform_iterator(sorted_paths.begin(),
                                                   PathIdxTransformOp());
-  Vector<path_t,ExecutionPolicyT> combined(policy,sorted_paths.size());
+  Vector<path_t, ExecutionPolicyT> combined(policy, sorted_paths.size());
   auto combined_out = thrust::reduce_by_key(
       policy, path_key, path_key + sorted_paths.size(), sorted_paths.begin(),
       thrust::make_discard_iterator(), combined.begin(),
@@ -1228,8 +1155,8 @@ using path_t=typename PathVectorT::value_type;
   // Combine bias for each path, over each group
   using size_vector = thrust::device_vector<
       size_t, typename DeviceAllocatorT::template rebind<size_t>::other>;
-  Vector<std::size_t,ExecutionPolicyT> keys_out(policy,num_paths);
-  Vector<double,ExecutionPolicyT> values_out(policy, num_paths);
+  Vector<std::size_t, ExecutionPolicyT> keys_out(policy, num_paths);
+  Vector<double, ExecutionPolicyT> values_out(policy, num_paths);
   auto group_key =
       thrust::make_transform_iterator(combined.begin(), GroupIdxTransformOp());
   auto values =

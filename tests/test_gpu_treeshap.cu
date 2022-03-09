@@ -694,34 +694,6 @@ TEST(GPUTreeShap, BFDBinPacking) {
   EXPECT_EQ(bin_packing[11], 3u);
 }
 
-TEST(GPUTreeShap, NFBinPacking) {
-  thrust::device_vector<int> counts(4);
-  counts[0] = 3;
-  counts[1] = 3;
-  counts[2] = 1;
-  counts[3] = 2;
-  auto bin_packing = detail::NFBinPacking(counts, 5);
-  EXPECT_EQ(bin_packing[0], 0u);
-  EXPECT_EQ(bin_packing[1], 1u);
-  EXPECT_EQ(bin_packing[2], 1u);
-  EXPECT_EQ(bin_packing[3], 2u);
-}
-
-TEST(GPUTreeShap, FFDBinPacking) {
-  thrust::device_vector<int> counts(5);
-  counts[0] = 3;
-  counts[1] = 2;
-  counts[2] = 3;
-  counts[3] = 4;
-  counts[4] = 1;
-  auto bin_packing = detail::FFDBinPacking(counts, 5);
-  EXPECT_EQ(bin_packing[0], 1u);
-  EXPECT_EQ(bin_packing[1], 1u);
-  EXPECT_EQ(bin_packing[2], 2u);
-  EXPECT_EQ(bin_packing[3], 0u);
-  EXPECT_EQ(bin_packing[4], 0u);
-}
-
 __global__ void TestContiguousGroup() {
   int label = threadIdx.x > 2 && threadIdx.x < 6 ? 1 : threadIdx.x >= 6 ? 2 : 0;
 
