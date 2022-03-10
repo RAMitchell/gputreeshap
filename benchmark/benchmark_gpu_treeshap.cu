@@ -13,15 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "../tests/test_utils.h"
 #include <GPUTreeShap/gpu_treeshap.h>
 #include <benchmark/benchmark.h>
-#include "../tests/test_utils.h"
-
 
 using namespace gpu_treeshap; // NOLINT
 
 class Fixture : public benchmark::Fixture {
- public:
+public:
   void SetUp(const ::benchmark::State &state) override {
     num_groups = 5;
     num_rows = state.range(0);
@@ -70,6 +69,38 @@ BENCHMARK_REGISTER_F(Fixture, GPUTreeShap)
     ->Args({1000, 10, 6, 1000})
     ->Args({10000, 50, 10, 1000})
     ->Args({100000, 500, 20, 10000});
+
+BENCHMARK_DEFINE_F(Fixture, GPUTreeShapDevicePolicy)
+(benchmark::State &st) { // NOLINT
+  GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
+              phis->end(), thrust::device);
+  for (auto _ : st) {
+    GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
+                phis->end(), thrust::device);
+  }
+}
+BENCHMARK_REGISTER_F(Fixture, GPUTreeShapDevicePolicy)
+    ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
+    ->Args({1, 10, 6, 1000})
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(Fixture, GPUTreeShapCustomPolicy)
+(benchmark::State &st) { // NOLINT
+  GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
+              phis->end(), thrust::device);
+
+  cudaStream_t s; 
+  cudaStreamCreate(&s);
+  for (auto _ : st) {
+    GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
+                phis->end(), thrust::cuda::par.on(s));
+  }
+  cudaStreamDestroy(s);
+}
+BENCHMARK_REGISTER_F(Fixture, GPUTreeShapCustomPolicy)
+    ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
+    ->Args({1, 10, 6, 1000})
+    ->Unit(benchmark::kMillisecond);
 
 BENCHMARK_DEFINE_F(Fixture, GPUTreeShapInterventional)
 (benchmark::State &st) { // NOLINT
