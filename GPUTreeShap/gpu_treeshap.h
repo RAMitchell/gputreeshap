@@ -646,14 +646,10 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
   }
 }
 
-template <typename DatasetT, typename SizeTAllocatorT, typename PathAllocatorT,
-          typename SplitConditionT>
-void ComputeShapInteractions(
-    DatasetT X,
-    const thrust::device_vector<size_t, SizeTAllocatorT> &bin_segments,
-    const thrust::device_vector<PathElement<SplitConditionT>, PathAllocatorT>
-        &path_elements,
-    size_t num_groups, double *phis) {
+template <typename DatasetT, typename SegmentVectorT, typename PathVectorT>
+void ComputeShapInteractions(DatasetT X, const SegmentVectorT &bin_segments,
+                             const PathVectorT &path_elements,
+                             size_t num_groups, double *phis) {
   size_t bins_per_row = bin_segments.size() - 1;
   const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
   const int warps_per_block = kBlockThreads / 32;
@@ -735,14 +731,11 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
   }
 }
 
-template <typename DatasetT, typename SizeTAllocatorT, typename PathAllocatorT,
-          typename SplitConditionT>
-void ComputeShapTaylorInteractions(
-    DatasetT X,
-    const thrust::device_vector<size_t, SizeTAllocatorT> &bin_segments,
-    const thrust::device_vector<PathElement<SplitConditionT>, PathAllocatorT>
-        &path_elements,
-    size_t num_groups, double *phis) {
+template <typename DatasetT, typename SegmentVectorT, typename PathVectorT>
+void ComputeShapTaylorInteractions(DatasetT X,
+                                   const SegmentVectorT &bin_segments,
+                                   const PathVectorT &path_elements,
+                                   size_t num_groups, double *phis) {
   size_t bins_per_row = bin_segments.size() - 1;
   const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
   const int warps_per_block = kBlockThreads / 32;
@@ -847,14 +840,11 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
   }
 }
 
-template <typename DatasetT, typename SizeTAllocatorT, typename PathAllocatorT,
-          typename SplitConditionT>
-void ComputeShapInterventional(
-    DatasetT X, DatasetT R,
-    const thrust::device_vector<size_t, SizeTAllocatorT> &bin_segments,
-    const thrust::device_vector<PathElement<SplitConditionT>, PathAllocatorT>
-        &path_elements,
-    size_t num_groups, double *phis) {
+template <typename DatasetT, typename SegmentVectorT, typename PathVectorT>
+void ComputeShapInterventional(DatasetT X, DatasetT R,
+                               const SegmentVectorT &bin_segments,
+                               const PathVectorT &path_elements,
+                               size_t num_groups, double *phis) {
   size_t bins_per_row = bin_segments.size() - 1;
   const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
   const int warps_per_block = kBlockThreads / 32;
@@ -1188,6 +1178,25 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
  *  @{
  */
 
+template <typename ExecutionPolicyT, typename path_t> class PreprocessedModel {
+public:
+  template <typename PathIteratorT>
+  PreprocessedModel(const ExecutionPolicyT &policy, PathIteratorT begin,
+                    PathIteratorT end, size_t num_groups)
+      : bias(policy, num_groups, 0.0), deduplicated_paths(policy, 0),
+        device_bin_segments(policy, 0), num_groups(num_groups) {
+    detail::Vector<path_t, ExecutionPolicyT> device_paths(policy, begin, end);
+    detail::ComputeBias(device_paths, &bias, policy);
+    detail::PreprocessPaths(&device_paths, &deduplicated_paths,
+                            &device_bin_segments, policy);
+  }
+
+  detail::Vector<double, ExecutionPolicyT> bias;
+  detail::Vector<path_t, ExecutionPolicyT> deduplicated_paths;
+  detail::Vector<std::size_t, ExecutionPolicyT> device_bin_segments;
+  size_t num_groups;
+};
+
 /*!
  * Compute feature contributions on the GPU given a set of unique paths through
  * a tree ensemble and a dataset. Uses device memory proportional to the tree
@@ -1225,8 +1234,7 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
  * phis.
  * \param phis_end    End iterator for output phis.
  */
-template <typename DeviceAllocatorT = thrust::device_allocator<int>,
-          typename DatasetT, typename PathIteratorT, typename PhiIteratorT,
+template <typename DatasetT, typename PathIteratorT, typename PhiIteratorT,
           typename ExecutionPolicyT = decltype(thrust::device)>
 void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                  size_t num_groups, PhiIteratorT phis_begin,
@@ -1244,12 +1252,11 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
   // Compute the global bias
+  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+      policy, begin, end, num_groups);
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);
-  detail::Vector<path_t, ExecutionPolicyT> device_paths(policy, begin, end);
-  detail::Vector<double, ExecutionPolicyT> bias(policy, num_groups, 0.0);
-  detail::ComputeBias(device_paths, &bias, policy);
-  auto d_bias = bias.data().get();
+  auto d_bias = preprocessed_model.bias.data().get();
   auto d_temp_phi = temp_phi.data().get();
   thrust::for_each_n(policy, thrust::make_counting_iterator(0llu),
                      X.NumRows() * num_groups, [=] __device__(size_t idx) {
@@ -1259,13 +1266,11 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                                            X.NumCols(), X.NumCols())] +=
                            d_bias[group];
                      });
-  detail::Vector<path_t, ExecutionPolicyT> deduplicated_paths(policy, 0);
-  detail::Vector<std::size_t, ExecutionPolicyT> device_bin_segments(policy, 0);
-  detail::PreprocessPaths(&device_paths, &deduplicated_paths,
-                          &device_bin_segments, policy);
 
-  detail::ComputeShap(X, device_bin_segments, deduplicated_paths, num_groups,
-                      temp_phi.data().get(), policy);
+  detail::ComputeShap(X, preprocessed_model.device_bin_segments,
+                      preprocessed_model.deduplicated_paths,
+                      preprocessed_model.num_groups, temp_phi.data().get(),
+                      policy);
   thrust::copy(policy, temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 
@@ -1304,11 +1309,12 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
  * \param phis_begin  Begin iterator for output phis.
  * \param phis_end    End iterator for output phis.
  */
-template <typename DeviceAllocatorT = thrust::device_allocator<int>,
-          typename DatasetT, typename PathIteratorT, typename PhiIteratorT>
+template <typename DatasetT, typename PathIteratorT, typename PhiIteratorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
 void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
                              size_t num_groups, PhiIteratorT phis_begin,
-                             PhiIteratorT phis_end) {
+                             PhiIteratorT phis_end,
+                             const ExecutionPolicyT &policy = thrust::device) {
   if (X.NumRows() == 0 || X.NumCols() == 0 || end - begin <= 0)
     return;
   if (size_t(phis_end - phis_begin) <
@@ -1319,20 +1325,13 @@ void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
         "num_groups");
   }
 
-  using size_vector = detail::RebindVector<size_t, DeviceAllocatorT>;
-  using double_vector = detail::RebindVector<double, DeviceAllocatorT>;
-  using path_vector = detail::RebindVector<
-      typename std::iterator_traits<PathIteratorT>::value_type,
-      DeviceAllocatorT>;
-  using split_condition =
-      typename std::iterator_traits<PathIteratorT>::value_type::split_type;
-
+  using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
+  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+      policy, begin, end, num_groups);
   // Compute the global bias
-  double_vector temp_phi(phis_end - phis_begin, 0.0);
-  path_vector device_paths(begin, end);
-  double_vector bias(num_groups, 0.0);
-  detail::ComputeBias(device_paths, &bias);
-  auto d_bias = bias.data().get();
+  detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
+                                                    phis_end - phis_begin, 0.0);
+  auto d_bias = preprocessed_model.bias.data().get();
   auto d_temp_phi = temp_phi.data().get();
   thrust::for_each_n(
       thrust::make_counting_iterator(0llu), X.NumRows() * num_groups,
@@ -1344,13 +1343,10 @@ void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
             d_bias[group];
       });
 
-  path_vector deduplicated_paths;
-  size_vector device_bin_segments;
-  detail::PreprocessPaths(&device_paths, &deduplicated_paths,
-                          &device_bin_segments);
-
-  detail::ComputeShapInteractions(X, device_bin_segments, deduplicated_paths,
-                                  num_groups, temp_phi.data().get());
+  detail::ComputeShapInteractions(X, preprocessed_model.device_bin_segments,
+                                  preprocessed_model.deduplicated_paths,
+                                  preprocessed_model.num_groups,
+                                  temp_phi.data().get());
   thrust::copy(temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 
@@ -1389,12 +1385,12 @@ void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
  * \param phis_begin  Begin iterator for output phis.
  * \param phis_end    End iterator for output phis.
  */
-template <typename DeviceAllocatorT = thrust::device_allocator<int>,
-          typename DatasetT, typename PathIteratorT, typename PhiIteratorT>
-void GPUTreeShapTaylorInteractions(DatasetT X, PathIteratorT begin,
-                                   PathIteratorT end, size_t num_groups,
-                                   PhiIteratorT phis_begin,
-                                   PhiIteratorT phis_end) {
+template <typename DatasetT, typename PathIteratorT, typename PhiIteratorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void GPUTreeShapTaylorInteractions(
+    DatasetT X, PathIteratorT begin, PathIteratorT end, size_t num_groups,
+    PhiIteratorT phis_begin, PhiIteratorT phis_end,
+    const ExecutionPolicyT &policy = thrust::device) {
   using phis_type = typename std::iterator_traits<PhiIteratorT>::value_type;
   static_assert(std::is_floating_point<phis_type>::value,
                 "Phis type must be floating point");
@@ -1410,20 +1406,13 @@ void GPUTreeShapTaylorInteractions(DatasetT X, PathIteratorT begin,
         "num_groups");
   }
 
-  using size_vector = detail::RebindVector<size_t, DeviceAllocatorT>;
-  using double_vector = detail::RebindVector<double, DeviceAllocatorT>;
-  using path_vector = detail::RebindVector<
-      typename std::iterator_traits<PathIteratorT>::value_type,
-      DeviceAllocatorT>;
-  using split_condition =
-      typename std::iterator_traits<PathIteratorT>::value_type::split_type;
-
+  using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
+  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+      policy, begin, end, num_groups);
+  detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
+                                                    phis_end - phis_begin, 0.0);
   // Compute the global bias
-  double_vector temp_phi(phis_end - phis_begin, 0.0);
-  path_vector device_paths(begin, end);
-  double_vector bias(num_groups, 0.0);
-  detail::ComputeBias(device_paths, &bias);
-  auto d_bias = bias.data().get();
+  auto d_bias = preprocessed_model.bias.data().get();
   auto d_temp_phi = temp_phi.data().get();
   thrust::for_each_n(
       thrust::make_counting_iterator(0llu), X.NumRows() * num_groups,
@@ -1435,14 +1424,10 @@ void GPUTreeShapTaylorInteractions(DatasetT X, PathIteratorT begin,
             d_bias[group];
       });
 
-  path_vector deduplicated_paths;
-  size_vector device_bin_segments;
-  detail::PreprocessPaths(&device_paths, &deduplicated_paths,
-                          &device_bin_segments);
-
-  detail::ComputeShapTaylorInteractions(X, device_bin_segments,
-                                        deduplicated_paths, num_groups,
-                                        temp_phi.data().get());
+  detail::ComputeShapTaylorInteractions(
+      X, preprocessed_model.device_bin_segments,
+      preprocessed_model.deduplicated_paths, preprocessed_model.num_groups,
+      temp_phi.data().get());
   thrust::copy(temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 
@@ -1476,11 +1461,12 @@ void GPUTreeShapTaylorInteractions(DatasetT X, PathIteratorT begin,
  * contributions per output class. \param phis_begin  Begin iterator for output
  * phis. \param phis_end    End iterator for output phis.
  */
-template <typename DeviceAllocatorT = thrust::device_allocator<int>,
-          typename DatasetT, typename PathIteratorT, typename PhiIteratorT>
-void GPUTreeShapInterventional(DatasetT X, DatasetT R, PathIteratorT begin,
-                               PathIteratorT end, size_t num_groups,
-                               PhiIteratorT phis_begin, PhiIteratorT phis_end) {
+template <typename DatasetT, typename PathIteratorT, typename PhiIteratorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void GPUTreeShapInterventional(
+    DatasetT X, DatasetT R, PathIteratorT begin, PathIteratorT end,
+    size_t num_groups, PhiIteratorT phis_begin, PhiIteratorT phis_end,
+    const ExecutionPolicyT &policy = thrust::device) {
   if (X.NumRows() == 0 || X.NumCols() == 0 || end - begin <= 0)
     return;
 
@@ -1491,24 +1477,15 @@ void GPUTreeShapInterventional(DatasetT X, DatasetT R, PathIteratorT begin,
         "num_groups");
   }
 
-  using size_vector = detail::RebindVector<size_t, DeviceAllocatorT>;
-  using double_vector = detail::RebindVector<double, DeviceAllocatorT>;
-  using path_vector = detail::RebindVector<
-      typename std::iterator_traits<PathIteratorT>::value_type,
-      DeviceAllocatorT>;
-  using split_condition =
-      typename std::iterator_traits<PathIteratorT>::value_type::split_type;
-
-  double_vector temp_phi(phis_end - phis_begin, 0.0);
-  path_vector device_paths(begin, end);
-
-  path_vector deduplicated_paths;
-  size_vector device_bin_segments;
-  detail::PreprocessPaths(&device_paths, &deduplicated_paths,
-                          &device_bin_segments);
-  detail::ComputeShapInterventional(X, R, device_bin_segments,
-                                    deduplicated_paths, num_groups,
-                                    temp_phi.data().get());
+  using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
+  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+      policy, begin, end, num_groups);
+  detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
+                                                    phis_end - phis_begin, 0.0);
+  detail::ComputeShapInterventional(
+      X, R, preprocessed_model.device_bin_segments,
+      preprocessed_model.deduplicated_paths, preprocessed_model.num_groups,
+      temp_phi.data().get());
   thrust::copy(temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 
