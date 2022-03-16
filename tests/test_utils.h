@@ -18,18 +18,19 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <thrust/system/cuda/execution_policy.h>
 #include <vector>
 
 namespace gpu_treeshap {
 
 class DenseDatasetWrapper {
-  const float* data;
+  const float *data;
   int num_rows;
   int num_cols;
 
- public:
+public:
   DenseDatasetWrapper() = default;
-  DenseDatasetWrapper(const float* data, int num_rows, int num_cols)
+  DenseDatasetWrapper(const float *data, int num_rows, int num_cols)
       : data(data), num_rows(num_rows), num_cols(num_cols) {}
   __device__ float GetElement(size_t row_idx, size_t col_idx) const {
     return data[row_idx * num_cols + col_idx];
@@ -39,7 +40,7 @@ class DenseDatasetWrapper {
 };
 
 class TestDataset {
- public:
+public:
   std::vector<float> host_data;
   thrust::device_vector<float> device_data;
   size_t num_rows;
@@ -52,7 +53,7 @@ class TestDataset {
     std::uniform_real_distribution<float> dis;
     std::bernoulli_distribution bern(missing_fraction);
     host_data.resize(num_rows * num_cols);
-    for (auto& e : host_data) {
+    for (auto &e : host_data) {
       e = bern(gen) ? std::numeric_limits<float>::quiet_NaN() : dis(gen);
     }
     device_data = host_data;
@@ -63,9 +64,9 @@ class TestDataset {
 };
 
 template <typename SplitConditionT>
-void GenerateModel(std::vector<PathElement<SplitConditionT>>* model, int group,
+void GenerateModel(std::vector<PathElement<SplitConditionT>> *model, int group,
                    size_t max_depth, size_t num_features, size_t num_paths,
-                   std::mt19937* gen, float max_v) {
+                   std::mt19937 *gen, float max_v) {
   std::uniform_real_distribution<float> value_dis(-max_v, max_v);
   std::uniform_int_distribution<int64_t> feature_dis(0, num_features - 1);
   std::bernoulli_distribution bern_dis;
@@ -92,12 +93,8 @@ void GenerateModel(std::vector<PathElement<SplitConditionT>>* model, int group,
       SplitConditionT split(lower_bound, upper_bound, bern_dis(*gen));
       std::uniform_real_distribution<float> zero_fraction_dis(0.05, 1.0);
       model->emplace_back(PathElement<SplitConditionT>{
-          base_path_idx + i,
-          feature_dis(*gen),
-          group,
-           split,
-          zero_fraction_dis(*gen),
-          v});
+          base_path_idx + i, feature_dis(*gen), group, split,
+          zero_fraction_dis(*gen), v});
     }
   }
 }
@@ -115,16 +112,16 @@ GenerateEnsembleModel(size_t num_groups, size_t max_depth, size_t num_features,
 }
 
 std::vector<float> Predict(
-    const std::vector<PathElement<gpu_treeshap::XgboostSplitCondition>>& model,
-    const TestDataset& X, size_t num_groups) {
+    const std::vector<PathElement<gpu_treeshap::XgboostSplitCondition>> &model,
+    const TestDataset &X, size_t num_groups) {
   std::vector<float> predictions(X.num_rows * num_groups);
   for (auto i = 0ull; i < X.num_rows; i++) {
-    const float* row = X.host_data.data() + i * X.num_cols;
+    const float *row = X.host_data.data() + i * X.num_cols;
     float current_v = model.front().v;
     size_t current_path_idx = model.front().path_idx;
     int current_group = model.front().group;
     bool valid = true;
-    for (const auto& e : model) {
+    for (const auto &e : model) {
       if (e.path_idx != current_path_idx) {
         if (valid) {
           predictions[i * num_groups + current_group] += current_v;
@@ -152,4 +149,20 @@ std::vector<float> Predict(
 
   return predictions;
 }
-}  // namespace gpu_treeshap
+
+typedef thrust::device_allocator<int> Alloc;
+
+using thrust_exec_policy_t = thrust::detail::execute_with_allocator<
+    Alloc, thrust::cuda_cub::execute_on_stream_base>;
+
+class custom_policy : public thrust_exec_policy_t {
+public:
+  custom_policy(cudaStream_t stream = nullptr)
+      : thrust_exec_policy_t(
+            thrust::cuda::par(Alloc()).on(stream)) {}
+  custom_policy()
+      : thrust_exec_policy_t(
+            thrust::cuda::par(Alloc()).on(nullptr)) {}
+};
+
+} // namespace gpu_treeshap

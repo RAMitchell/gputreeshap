@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cub/cub.cuh>
 #include <functional>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <thrust/device_allocator.h>
@@ -27,6 +28,7 @@
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/logical.h>
 #include <thrust/reduce.h>
+#include <thrust/system/detail/generic/select_system.h>
 #include <utility>
 #include <vector>
 
@@ -184,7 +186,15 @@ public:
   Vector(const ExecutionPolicyT &policy, IterT begin, IterT end)
       : policy(policy), n(end - begin) {
     ptr = thrust::malloc<T>(policy, n);
-    thrust::copy(begin, end, this->begin());
+    typedef typename thrust::iterator_system<IterT>::type System1;
+    System1 system1;
+    thrust::detail::two_system_copy(system1, policy, begin, end, ptr);
+  }
+  // construct from same policy
+  Vector(const ExecutionPolicyT &policy, ptr_t begin, ptr_t end)
+      : policy(policy), n(end - begin) {
+    ptr = thrust::malloc<T>(policy, n);
+    thrust::copy(policy, begin, end, ptr);
   }
   ~Vector() { thrust::free(policy, ptr); }
   ptr_t begin() { return ptr; }
@@ -512,10 +522,11 @@ __global__ void __launch_bounds__(GPUTREESHAP_MAX_THREADS_PER_BLOCK)
   }
 }
 
-template <typename DatasetT, typename SegmentVectorT, typename PathVectorT>
+template <typename DatasetT, typename SegmentVectorT, typename PathVectorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
 void ComputeShap(DatasetT X, const SegmentVectorT &bin_segments,
                  const PathVectorT &path_elements, size_t num_groups,
-                 double *phis) {
+                 double *phis, const ExecutionPolicyT &policy) {
   size_t bins_per_row = bin_segments.size() - 1;
   const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
   const int warps_per_block = kBlockThreads / 32;
@@ -525,7 +536,7 @@ void ComputeShap(DatasetT X, const SegmentVectorT &bin_segments,
   const uint32_t grid_size = DivRoundUp(warps_needed, warps_per_block);
 
   ShapKernel<DatasetT, kBlockThreads, kRowsPerWarp>
-      <<<grid_size, kBlockThreads>>>(
+      <<<grid_size, kBlockThreads, 0>>>(
           X, bins_per_row, path_elements.data().get(),
           bin_segments.data().get(), num_groups, phis);
 }
@@ -877,24 +888,21 @@ void GetBinSegments(const ExecutionPolicyT &policy, const PathVectorT &paths,
                          bin_segments->begin());
 }
 
-struct DeduplicateKeyTransformOp {
-  template <typename SplitConditionT>
-  __device__ thrust::pair<size_t, int64_t>
-  operator()(const PathElement<SplitConditionT> &e) {
+template <typename path_t>
+struct DeduplicateKeyTransformOp
+    : public thrust::unary_function<path_t, thrust::pair<size_t, int64_t>> {
+  __host__ __device__ thrust::pair<size_t, int64_t>
+  operator()(const path_t &e) {
     return {e.path_idx, e.feature_idx};
   }
 };
-
-inline void CheckCuda(cudaError_t err) {
-  if (err != cudaSuccess) {
-    throw thrust::system_error(err, thrust::cuda_category());
+template <typename path_t> struct MergeOp {
+  __host__ __device__ path_t
+  operator()(path_t a, const path_t &b) { // Combine duplicate features
+    a.split_condition.Merge(b.split_condition);
+    a.zero_fraction *= b.zero_fraction;
+    return a;
   }
-}
-
-template <typename Return>
-class DiscardOverload : public thrust::discard_iterator<Return> {
-public:
-  using value_type = Return; // NOLINT
 };
 
 template <typename PathVectorT,
@@ -918,19 +926,16 @@ void DeduplicatePaths(const ExecutionPolicyT &policy, PathVectorT *device_paths,
 
   deduplicated_paths->resize(device_paths->size());
 
+  using path_t = typename PathVectorT::value_type;
   auto key_transform = thrust::make_transform_iterator(
-      device_paths->begin(), DeduplicateKeyTransformOp());
+      device_paths->begin(), DeduplicateKeyTransformOp<path_t>());
   thrust::equal_to<thrust::pair<size_t, int64_t>> key_compare;
+  MergeOp<path_t> op;
+  auto discard = thrust::make_discard_iterator();
   auto end = thrust::reduce_by_key(
       policy, key_transform, key_transform + device_paths->size(),
-      device_paths->begin(), thrust::make_discard_iterator(),
-      deduplicated_paths->begin(), key_compare,
-      [=] __device__(auto a, const auto &b) {
-        // Combine duplicate features
-        a.split_condition.Merge(b.split_condition);
-        a.zero_fraction *= b.zero_fraction;
-        return a;
-      });
+      device_paths->begin(), discard, deduplicated_paths->begin(), key_compare,
+      op);
 
   deduplicated_paths->resize(end.second - deduplicated_paths->begin());
 }
@@ -977,10 +982,15 @@ struct BFDCompare {
 
 // Best Fit Decreasing bin packing
 // Efficient O(nlogn) implementation with balanced tree using std::set
-template <typename IntVectorT>
-std::vector<size_t> BFDBinPacking(const IntVectorT &counts,
-                                  int bin_limit = 32) {
-  thrust::host_vector<int> counts_host(counts.begin(), counts.end());
+template <typename IntVectorT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+std::vector<size_t>
+BFDBinPacking(const IntVectorT &counts, int bin_limit,
+              const ExecutionPolicyT &policy = thrust::device) {
+  std::vector<int> counts_host(counts.size());
+  thrust::detail::two_system_copy(policy, thrust::host, counts.begin(),
+                                  counts.end(), counts_host.begin());
+
   std::vector<kv> path_lengths(counts_host.size());
   for (auto i = 0ull; i < counts_host.size(); i++) {
     path_lengths[i] = {i, counts_host[i]};
@@ -1023,10 +1033,12 @@ void GetPathLengths(const ExecutionPolicyT &policy,
                     LengthVectorT *path_lengths) {
   auto constant = thrust::make_constant_iterator(1llu);
   auto discard = thrust::make_discard_iterator();
-  thrust::reduce_by_key(
+  auto result = thrust::reduce_by_key(
       policy, device_paths.begin(), device_paths.end(), constant, discard,
       path_lengths->begin(),
       [=] __device__(auto a, auto b) { return a.path_idx == b.path_idx; });
+
+  path_lengths->resize(result.second - path_lengths->begin());
 }
 
 struct PathTooLongOp {
@@ -1075,10 +1087,9 @@ void PreprocessPaths(PathVectorT *device_paths, PathVectorT *deduplicated_paths,
   // Sort paths by length and feature
   using path_t = typename PathVectorT::value_type;
   detail::DeduplicatePaths(policy, device_paths, deduplicated_paths);
-  auto num_paths = static_cast<path_t>(*(device_paths->end() - 1)).path_idx + 1;
-  Vector<int, ExecutionPolicyT> path_lengths(policy, num_paths, 0);
+  Vector<int, ExecutionPolicyT> path_lengths(policy, device_paths->size());
   detail::GetPathLengths(policy, *deduplicated_paths, &path_lengths);
-  auto cpu_bin_map = detail::BFDBinPacking(path_lengths);
+  auto cpu_bin_map = detail::BFDBinPacking(path_lengths, 32, policy);
   Vector<std::size_t, ExecutionPolicyT> device_bin_map(
       policy, cpu_bin_map.begin(), cpu_bin_map.end());
   detail::ValidatePaths(policy, *deduplicated_paths, path_lengths);
@@ -1140,7 +1151,8 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
   auto combined_out = thrust::reduce_by_key(
       policy, path_key, path_key + sorted_paths.size(), sorted_paths.begin(),
       thrust::make_discard_iterator(), combined.begin(),
-      thrust::equal_to<size_t>(), [=] __device__(path_t a, const path_t &b) {
+      thrust::equal_to<size_t>(),
+      [=] __host__ __device__(path_t a, const path_t &b) -> path_t {
         a.zero_fraction *= b.zero_fraction;
         return a;
       });
@@ -1247,14 +1259,13 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                                            X.NumCols(), X.NumCols())] +=
                            d_bias[group];
                      });
-
   detail::Vector<path_t, ExecutionPolicyT> deduplicated_paths(policy, 0);
   detail::Vector<std::size_t, ExecutionPolicyT> device_bin_segments(policy, 0);
   detail::PreprocessPaths(&device_paths, &deduplicated_paths,
                           &device_bin_segments, policy);
 
   detail::ComputeShap(X, device_bin_segments, deduplicated_paths, num_groups,
-                      temp_phi.data().get());
+                      temp_phi.data().get(), policy);
   thrust::copy(policy, temp_phi.begin(), temp_phi.end(), phis_begin);
 }
 

@@ -84,6 +84,7 @@ BENCHMARK_REGISTER_F(Fixture, GPUTreeShapDevicePolicy)
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
 
+
 BENCHMARK_DEFINE_F(Fixture, GPUTreeShapCustomPolicy)
 (benchmark::State &st) { // NOLINT
   GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
@@ -91,9 +92,10 @@ BENCHMARK_DEFINE_F(Fixture, GPUTreeShapCustomPolicy)
 
   cudaStream_t s; 
   cudaStreamCreate(&s);
+  custom_policy policy(s);
   for (auto _ : st) {
     GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
-                phis->end(), thrust::cuda::par.on(s));
+                phis->end(), thrust::device);
   }
   cudaStreamDestroy(s);
 }
