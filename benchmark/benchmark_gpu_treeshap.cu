@@ -70,7 +70,7 @@ BENCHMARK_REGISTER_F(Fixture, GPUTreeShap)
     ->Args({10000, 50, 10, 1000})
     ->Args({100000, 500, 20, 10000});
 
-BENCHMARK_DEFINE_F(Fixture, GPUTreeShapDevicePolicy)
+BENCHMARK_DEFINE_F(Fixture, PreprocessingNoCache)
 (benchmark::State &st) { // NOLINT
   GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
               phis->end(), thrust::device);
@@ -79,27 +79,23 @@ BENCHMARK_DEFINE_F(Fixture, GPUTreeShapDevicePolicy)
                 phis->end(), thrust::device);
   }
 }
-BENCHMARK_REGISTER_F(Fixture, GPUTreeShapDevicePolicy)
+BENCHMARK_REGISTER_F(Fixture, PreprocessingNoCache)
     ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
 
-
-BENCHMARK_DEFINE_F(Fixture, GPUTreeShapCustomPolicy)
+BENCHMARK_DEFINE_F(Fixture, PreprocessingCache)
 (benchmark::State &st) { // NOLINT
-  GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
-              phis->end(), thrust::device);
+  Cache<decltype(thrust::device), decltype(model)::value_type>
+      preprocessed_model(thrust::device, model.begin(), model.end(),
+                         num_groups);
 
-  cudaStream_t s; 
-  cudaStreamCreate(&s);
-  custom_policy policy(s);
   for (auto _ : st) {
-    GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
-                phis->end(), thrust::device);
+    GPUTreeShap(X, preprocessed_model, phis->begin(), phis->end(),
+                thrust::device);
   }
-  cudaStreamDestroy(s);
 }
-BENCHMARK_REGISTER_F(Fixture, GPUTreeShapCustomPolicy)
+BENCHMARK_REGISTER_F(Fixture, PreprocessingCache)
     ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);

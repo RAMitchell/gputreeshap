@@ -1178,10 +1178,10 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
  *  @{
  */
 
-template <typename ExecutionPolicyT, typename path_t> class PreprocessedModel {
+template <typename ExecutionPolicyT, typename path_t> class Cache {
 public:
   template <typename PathIteratorT>
-  PreprocessedModel(const ExecutionPolicyT &policy, PathIteratorT begin,
+  Cache(const ExecutionPolicyT &policy, PathIteratorT begin,
                     PathIteratorT end, size_t num_groups)
       : bias(policy, num_groups, 0.0), deduplicated_paths(policy, 0),
         device_bin_segments(policy, 0), num_groups(num_groups) {
@@ -1196,6 +1196,44 @@ public:
   detail::Vector<std::size_t, ExecutionPolicyT> device_bin_segments;
   size_t num_groups;
 };
+
+template <typename DatasetT, typename PhiIteratorT, typename PreprocessedModelT,
+          typename ExecutionPolicyT = decltype(thrust::device)>
+void GPUTreeShap(DatasetT X, const PreprocessedModelT &preprocessed_model,
+                 PhiIteratorT phis_begin, PhiIteratorT phis_end,
+                 const ExecutionPolicyT &policy = thrust::device) {
+  if (X.NumRows() == 0 || X.NumCols() == 0 ||
+      preprocessed_model.deduplicated_paths.size() == 0) {
+    return;
+  }
+
+  if (size_t(phis_end - phis_begin) <
+      X.NumRows() * (X.NumCols() + 1) * preprocessed_model.num_groups) {
+    throw std::invalid_argument(
+        "phis_out must be at least of size X.NumRows() * (X.NumCols() + 1) * "
+        "num_groups");
+  }
+
+  detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
+                                                    phis_end - phis_begin, 0.0);
+  auto d_bias = preprocessed_model.bias.data().get();
+  auto d_temp_phi = temp_phi.data().get();
+  auto num_groups = preprocessed_model.num_groups;
+  thrust::for_each_n(policy, thrust::make_counting_iterator(0llu),
+                     X.NumRows() * num_groups, [=] __device__(size_t idx) {
+                       size_t group = idx % num_groups;
+                       size_t row_idx = idx / num_groups;
+                       d_temp_phi[IndexPhi(row_idx, num_groups, group,
+                                           X.NumCols(), X.NumCols())] +=
+                           d_bias[group];
+                     });
+
+  detail::ComputeShap(X, preprocessed_model.device_bin_segments,
+                      preprocessed_model.deduplicated_paths,
+                      preprocessed_model.num_groups, temp_phi.data().get(),
+                      policy);
+  thrust::copy(policy, temp_phi.begin(), temp_phi.end(), phis_begin);
+}
 
 /*!
  * Compute feature contributions on the GPU given a set of unique paths through
@@ -1240,38 +1278,10 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                  size_t num_groups, PhiIteratorT phis_begin,
                  PhiIteratorT phis_end,
                  const ExecutionPolicyT &policy = thrust::device) {
-  if (X.NumRows() == 0 || X.NumCols() == 0 || end - begin <= 0)
-    return;
-
-  if (size_t(phis_end - phis_begin) <
-      X.NumRows() * (X.NumCols() + 1) * num_groups) {
-    throw std::invalid_argument(
-        "phis_out must be at least of size X.NumRows() * (X.NumCols() + 1) * "
-        "num_groups");
-  }
-
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  // Compute the global bias
-  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(
       policy, begin, end, num_groups);
-  detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
-                                                    phis_end - phis_begin, 0.0);
-  auto d_bias = preprocessed_model.bias.data().get();
-  auto d_temp_phi = temp_phi.data().get();
-  thrust::for_each_n(policy, thrust::make_counting_iterator(0llu),
-                     X.NumRows() * num_groups, [=] __device__(size_t idx) {
-                       size_t group = idx % num_groups;
-                       size_t row_idx = idx / num_groups;
-                       d_temp_phi[IndexPhi(row_idx, num_groups, group,
-                                           X.NumCols(), X.NumCols())] +=
-                           d_bias[group];
-                     });
-
-  detail::ComputeShap(X, preprocessed_model.device_bin_segments,
-                      preprocessed_model.deduplicated_paths,
-                      preprocessed_model.num_groups, temp_phi.data().get(),
-                      policy);
-  thrust::copy(policy, temp_phi.begin(), temp_phi.end(), phis_begin);
+  GPUTreeShap(X, preprocessed_model, phis_begin, phis_end, policy);
 }
 
 /*!
@@ -1326,7 +1336,7 @@ void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(
       policy, begin, end, num_groups);
   // Compute the global bias
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
@@ -1407,7 +1417,7 @@ void GPUTreeShapTaylorInteractions(
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(
       policy, begin, end, num_groups);
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);
@@ -1478,7 +1488,7 @@ void GPUTreeShapInterventional(
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  PreprocessedModel<ExecutionPolicyT, path_t> preprocessed_model(
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(
       policy, begin, end, num_groups);
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);

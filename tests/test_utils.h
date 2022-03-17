@@ -165,4 +165,10 @@ public:
             thrust::cuda::par(Alloc()).on(nullptr)) {}
 };
 
+__host__ __device__
+cudaError_t synchronize_stream(custom_policy&)
+{
+	return cudaSuccess;
+}
+
 } // namespace gpu_treeshap
