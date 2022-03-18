@@ -18,6 +18,11 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <thrust/mr/allocator.h>
+#include <thrust/mr/disjoint_pool.h>
+#include <thrust/mr/disjoint_tls_pool.h>
+#include <thrust/mr/new.h>
+#include <thrust/mr/pool.h>
 #include <thrust/system/cuda/execution_policy.h>
 #include <vector>
 
@@ -150,25 +155,26 @@ std::vector<float> Predict(
   return predictions;
 }
 
-typedef thrust::device_allocator<int> Alloc;
-
+using alloc_t = thrust::mr::allocator<
+    char, thrust::mr::disjoint_unsynchronized_pool_resource<
+              thrust::device_memory_resource, thrust::mr::new_delete_resource>>;
 using thrust_exec_policy_t = thrust::detail::execute_with_allocator<
-    Alloc, thrust::cuda_cub::execute_on_stream_base>;
+    alloc_t, thrust::cuda_cub::execute_on_stream_base>;
 
 class custom_policy : public thrust_exec_policy_t {
 public:
   custom_policy(cudaStream_t stream = nullptr)
       : thrust_exec_policy_t(
-            thrust::cuda::par(Alloc()).on(stream)) {}
-  custom_policy()
-      : thrust_exec_policy_t(
-            thrust::cuda::par(Alloc()).on(nullptr)) {}
+            thrust::cuda::par(alloc_t(&thrust::mr::tls_disjoint_pool(
+                                  thrust::mr::get_global_resource<
+                                      thrust::device_memory_resource>(),
+                                  thrust::mr::get_global_resource<
+                                      thrust::mr::new_delete_resource>())))
+                .on(stream)) {}
 };
 
-__host__ __device__
-cudaError_t synchronize_stream(custom_policy&)
-{
-	return cudaSuccess;
+__host__ __device__ cudaError_t synchronize_stream(custom_policy &) {
+  return cudaSuccess;
 }
 
 } // namespace gpu_treeshap

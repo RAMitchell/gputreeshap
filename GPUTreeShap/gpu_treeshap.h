@@ -16,7 +16,6 @@
 
 #pragma once
 #include <algorithm>
-#include <cub/cub.cuh>
 #include <functional>
 #include <iterator>
 #include <set>
@@ -29,6 +28,7 @@
 #include <thrust/logical.h>
 #include <thrust/reduce.h>
 #include <thrust/system/detail/generic/select_system.h>
+#include <thrust/system/cuda/detail/util.h>
 #include <utility>
 #include <vector>
 
@@ -536,7 +536,7 @@ void ComputeShap(DatasetT X, const SegmentVectorT &bin_segments,
   const uint32_t grid_size = DivRoundUp(warps_needed, warps_per_block);
 
   ShapKernel<DatasetT, kBlockThreads, kRowsPerWarp>
-      <<<grid_size, kBlockThreads, 0>>>(
+      <<<grid_size, kBlockThreads>>>(
           X, bins_per_row, path_elements.data().get(),
           bin_segments.data().get(), num_groups, phis);
 }

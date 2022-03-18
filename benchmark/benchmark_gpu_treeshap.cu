@@ -70,7 +70,7 @@ BENCHMARK_REGISTER_F(Fixture, GPUTreeShap)
     ->Args({10000, 50, 10, 1000})
     ->Args({100000, 500, 20, 10000});
 
-BENCHMARK_DEFINE_F(Fixture, PreprocessingNoCache)
+BENCHMARK_DEFINE_F(Fixture, SingleRowNoCache)
 (benchmark::State &st) { // NOLINT
   GPUTreeShap(X, model.begin(), model.end(), num_groups, phis->begin(),
               phis->end(), thrust::device);
@@ -79,12 +79,12 @@ BENCHMARK_DEFINE_F(Fixture, PreprocessingNoCache)
                 phis->end(), thrust::device);
   }
 }
-BENCHMARK_REGISTER_F(Fixture, PreprocessingNoCache)
+BENCHMARK_REGISTER_F(Fixture, SingleRowNoCache)
     ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_DEFINE_F(Fixture, PreprocessingCache)
+BENCHMARK_DEFINE_F(Fixture, SingleRowCache)
 (benchmark::State &st) { // NOLINT
   Cache<decltype(thrust::device), decltype(model)::value_type>
       preprocessed_model(thrust::device, model.begin(), model.end(),
@@ -95,7 +95,37 @@ BENCHMARK_DEFINE_F(Fixture, PreprocessingCache)
                 thrust::device);
   }
 }
-BENCHMARK_REGISTER_F(Fixture, PreprocessingCache)
+BENCHMARK_REGISTER_F(Fixture, SingleRowCache)
+    ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
+    ->Args({1, 10, 6, 1000})
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(Fixture, Cache)
+(benchmark::State &st) { // NOLINT
+  auto policy = custom_policy();
+  Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+      policy, model.begin(), model.end(), num_groups);
+  for (auto _ : st) {
+    Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+        policy, model.begin(), model.end(), num_groups);
+  }
+}
+BENCHMARK_REGISTER_F(Fixture, Cache)
+    ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
+    ->Args({1, 10, 6, 1000})
+    ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_DEFINE_F(Fixture, CacheCPU)
+(benchmark::State &st) { // NOLINT
+  auto policy = thrust::host;
+  Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+      policy, model.begin(), model.end(), num_groups);
+  for (auto _ : st) {
+    Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+        policy, model.begin(), model.end(), num_groups);
+  }
+}
+BENCHMARK_REGISTER_F(Fixture, Cache)
     ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
