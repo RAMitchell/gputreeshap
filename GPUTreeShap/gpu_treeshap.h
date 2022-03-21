@@ -27,8 +27,6 @@
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/logical.h>
 #include <thrust/reduce.h>
-#include <thrust/system/detail/generic/select_system.h>
-#include <thrust/system/cuda/detail/util.h>
 #include <utility>
 #include <vector>
 
@@ -166,6 +164,10 @@ public:
   using value_type = T;
   using ptr_t = decltype(thrust::malloc<T>(std::declval<ExecutionPolicyT>(),
                                            std::declval<std::size_t>()));
+  using demoted_ptr_t = typename std::conditional<
+      std::is_convertible<ExecutionPolicyT, thrust::device_system_tag>::value,
+      thrust::pointer<T, thrust::cuda::tag>,
+      thrust::pointer<T, thrust::cpp::tag>>::type;
 
 private:
   const ExecutionPolicyT &policy;
@@ -197,12 +199,12 @@ public:
     thrust::copy(policy, begin, end, ptr);
   }
   ~Vector() { thrust::free(policy, ptr); }
-  ptr_t begin() { return ptr; }
-  ptr_t end() { return ptr + n; }
-  ptr_t begin() const { return ptr; }
-  ptr_t end() const { return ptr + n; }
-  ptr_t data() { return ptr; }
-  const ptr_t data() const { return ptr; }
+  demoted_ptr_t begin() { return demoted_ptr_t(ptr.get()); }
+  demoted_ptr_t end() { return this->begin() + n; }
+  demoted_ptr_t begin() const { return demoted_ptr_t(ptr.get()); }
+  demoted_ptr_t end() const { return this->begin() + n; }
+  demoted_ptr_t data() { return demoted_ptr_t(ptr.get()); }
+  const demoted_ptr_t data() const { return demoted_ptr_t(ptr.get()); }
   std::size_t size() const { return n; }
   void resize(std::size_t n) {
     if (n < this->size()) {
@@ -527,6 +529,7 @@ template <typename DatasetT, typename SegmentVectorT, typename PathVectorT,
 void ComputeShap(DatasetT X, const SegmentVectorT &bin_segments,
                  const PathVectorT &path_elements, size_t num_groups,
                  double *phis, const ExecutionPolicyT &policy) {
+  (void)policy; // silence unused parameter warning
   size_t bins_per_row = bin_segments.size() - 1;
   const int kBlockThreads = GPUTREESHAP_MAX_THREADS_PER_BLOCK;
   const int warps_per_block = kBlockThreads / 32;
@@ -870,10 +873,13 @@ void GetBinSegments(const ExecutionPolicyT &policy, const PathVectorT &paths,
   auto d_bin_map = bin_map.data();
   auto constant = thrust::make_constant_iterator(1llu);
   auto discard = thrust::make_discard_iterator();
-  thrust::reduce_by_key(policy, paths.begin(), paths.end(), constant, discard,
-                        bin_segments->begin(), [=] __device__(auto a, auto b) {
-                          return d_bin_map[a.path_idx] == d_bin_map[b.path_idx];
-                        });
+  using path_t = typename PathVectorT::value_type;
+  thrust::reduce_by_key(
+      policy, paths.begin(), paths.end(), constant, discard,
+      bin_segments->begin(),
+      [=] __host__ __device__(const path_t &a, const path_t &b) {
+        return d_bin_map[a.path_idx] == d_bin_map[b.path_idx];
+      });
   thrust::exclusive_scan(policy, bin_segments->begin(), bin_segments->end(),
                          bin_segments->begin());
 }
@@ -900,8 +906,9 @@ template <typename PathVectorT,
 void DeduplicatePaths(const ExecutionPolicyT &policy, PathVectorT *device_paths,
                       PathVectorT *deduplicated_paths) {
   // Sort by feature
+  using path_t = typename PathVectorT::value_type;
   thrust::sort(policy, device_paths->begin(), device_paths->end(),
-               [=] __device__(const auto &a, const auto &b) {
+               [=] __host__ __device__(const path_t &a, const path_t &b) {
                  if (a.path_idx < b.path_idx)
                    return true;
                  if (b.path_idx < a.path_idx)
@@ -938,7 +945,7 @@ void SortPaths(const ExecutionPolicyT &policy, PathVectorT *paths,
   using path_t = typename PathVectorT::value_type;
   auto d_bin_map = bin_map.data();
   thrust::sort(policy, paths->begin(), paths->end(),
-               [=] __device__(const path_t &a, const path_t &b) {
+               [=] __host__ __device__(const path_t &a, const path_t &b) {
                  size_t a_bin = d_bin_map[a.path_idx];
                  size_t b_bin = d_bin_map[b.path_idx];
                  if (a_bin < b_bin)
@@ -974,12 +981,9 @@ struct BFDCompare {
 // Efficient O(nlogn) implementation with balanced tree using std::set
 template <typename IntVectorT,
           typename ExecutionPolicyT = decltype(thrust::device)>
-std::vector<size_t>
-BFDBinPacking(const IntVectorT &counts, int bin_limit,
-              const ExecutionPolicyT &policy = thrust::device) {
+std::vector<size_t> BFDBinPacking(const IntVectorT &counts, int bin_limit) {
   std::vector<int> counts_host(counts.size());
-  thrust::detail::two_system_copy(policy, thrust::host, counts.begin(),
-                                  counts.end(), counts_host.begin());
+  thrust::copy(counts.begin(), counts.end(), counts_host.begin());
 
   std::vector<kv> path_lengths(counts_host.size());
   for (auto i = 0ull; i < counts_host.size(); i++) {
@@ -1023,21 +1027,24 @@ void GetPathLengths(const ExecutionPolicyT &policy,
                     LengthVectorT *path_lengths) {
   auto constant = thrust::make_constant_iterator(1llu);
   auto discard = thrust::make_discard_iterator();
+  using path_t = typename PathVectorT::value_type;
   auto result = thrust::reduce_by_key(
       policy, device_paths.begin(), device_paths.end(), constant, discard,
       path_lengths->begin(),
-      [=] __device__(auto a, auto b) { return a.path_idx == b.path_idx; });
+      [=] __host__ __device__(const path_t &a, const path_t &b) {
+        return a.path_idx == b.path_idx;
+      });
 
   path_lengths->resize(result.second - path_lengths->begin());
 }
 
 struct PathTooLongOp {
-  __device__ size_t operator()(size_t length) { return length > 32; }
+  __host__ __device__ size_t operator()(size_t length) { return length > 32; }
 };
 
 template <typename SplitConditionT> struct IncorrectVOp {
   const PathElement<SplitConditionT> *paths;
-  __device__ size_t operator()(size_t idx) {
+  __host__ __device__ size_t operator()(size_t idx) {
     auto a = paths[idx - 1];
     auto b = paths[idx];
     return a.path_idx == b.path_idx && a.v != b.v;
@@ -1079,7 +1086,7 @@ void PreprocessPaths(PathVectorT *device_paths, PathVectorT *deduplicated_paths,
   detail::DeduplicatePaths(policy, device_paths, deduplicated_paths);
   Vector<int, ExecutionPolicyT> path_lengths(policy, device_paths->size());
   detail::GetPathLengths(policy, *deduplicated_paths, &path_lengths);
-  auto cpu_bin_map = detail::BFDBinPacking(path_lengths, 32, policy);
+  auto cpu_bin_map = detail::BFDBinPacking(path_lengths, 32);
   Vector<std::size_t, ExecutionPolicyT> device_bin_map(
       policy, cpu_bin_map.begin(), cpu_bin_map.end());
   detail::ValidatePaths(policy, *deduplicated_paths, path_lengths);
@@ -1090,21 +1097,21 @@ void PreprocessPaths(PathVectorT *device_paths, PathVectorT *deduplicated_paths,
 
 struct PathIdxTransformOp {
   template <typename SplitConditionT>
-  __device__ size_t operator()(const PathElement<SplitConditionT> &e) {
+  __host__ __device__ size_t operator()(const PathElement<SplitConditionT> &e) {
     return e.path_idx;
   }
 };
 
 struct GroupIdxTransformOp {
   template <typename SplitConditionT>
-  __device__ size_t operator()(const PathElement<SplitConditionT> &e) {
+  __host__ __device__ size_t operator()(const PathElement<SplitConditionT> &e) {
     return e.group;
   }
 };
 
 struct BiasTransformOp {
   template <typename SplitConditionT>
-  __device__ double operator()(const PathElement<SplitConditionT> &e) {
+  __host__ __device__ double operator()(const PathElement<SplitConditionT> &e) {
     return e.zero_fraction * e.v;
   }
 };
@@ -1121,7 +1128,7 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
                                                 device_paths.end());
   // Make sure groups are contiguous
   thrust::sort(policy, sorted_paths.begin(), sorted_paths.end(),
-               [=] __device__(const path_t &a, const path_t &b) {
+               [=] __host__ __device__(const path_t &a, const path_t &b) {
                  if (a.group < b.group)
                    return true;
                  if (b.group < a.group)
@@ -1165,7 +1172,7 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
   auto d_keys_out = keys_out.data().get();
   auto d_values_out = values_out.data().get();
   auto d_bias = bias->data().get();
-  thrust::for_each_n(policy, counting, n, [=] __device__(size_t idx) {
+  thrust::for_each_n(policy, counting, n, [=] __host__ __device__(size_t idx) {
     d_bias[d_keys_out[idx]] = d_values_out[idx];
   });
 }
@@ -1181,8 +1188,8 @@ void ComputeBias(const PathVectorT &device_paths, DoubleVectorT *bias,
 template <typename ExecutionPolicyT, typename path_t> class Cache {
 public:
   template <typename PathIteratorT>
-  Cache(const ExecutionPolicyT &policy, PathIteratorT begin,
-                    PathIteratorT end, size_t num_groups)
+  Cache(const ExecutionPolicyT &policy, PathIteratorT begin, PathIteratorT end,
+        size_t num_groups)
       : bias(policy, num_groups, 0.0), deduplicated_paths(policy, 0),
         device_bin_segments(policy, 0), num_groups(num_groups) {
     detail::Vector<path_t, ExecutionPolicyT> device_paths(policy, begin, end);
@@ -1279,8 +1286,8 @@ void GPUTreeShap(DatasetT X, PathIteratorT begin, PathIteratorT end,
                  PhiIteratorT phis_end,
                  const ExecutionPolicyT &policy = thrust::device) {
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  Cache<ExecutionPolicyT, path_t> preprocessed_model(
-      policy, begin, end, num_groups);
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(policy, begin, end,
+                                                     num_groups);
   GPUTreeShap(X, preprocessed_model, phis_begin, phis_end, policy);
 }
 
@@ -1336,8 +1343,8 @@ void GPUTreeShapInteractions(DatasetT X, PathIteratorT begin, PathIteratorT end,
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  Cache<ExecutionPolicyT, path_t> preprocessed_model(
-      policy, begin, end, num_groups);
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(policy, begin, end,
+                                                     num_groups);
   // Compute the global bias
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);
@@ -1417,8 +1424,8 @@ void GPUTreeShapTaylorInteractions(
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  Cache<ExecutionPolicyT, path_t> preprocessed_model(
-      policy, begin, end, num_groups);
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(policy, begin, end,
+                                                     num_groups);
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);
   // Compute the global bias
@@ -1488,8 +1495,8 @@ void GPUTreeShapInterventional(
   }
 
   using path_t = typename std::iterator_traits<PathIteratorT>::value_type;
-  Cache<ExecutionPolicyT, path_t> preprocessed_model(
-      policy, begin, end, num_groups);
+  Cache<ExecutionPolicyT, path_t> preprocessed_model(policy, begin, end,
+                                                     num_groups);
   detail::Vector<double, ExecutionPolicyT> temp_phi(policy,
                                                     phis_end - phis_begin, 0.0);
   detail::ComputeShapInterventional(

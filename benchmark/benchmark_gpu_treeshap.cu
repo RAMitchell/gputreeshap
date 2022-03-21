@@ -16,6 +16,7 @@
 #include "../tests/test_utils.h"
 #include <GPUTreeShap/gpu_treeshap.h>
 #include <benchmark/benchmark.h>
+#include <thrust/system/omp/execution_policy.h>
 
 using namespace gpu_treeshap; // NOLINT
 
@@ -115,6 +116,21 @@ BENCHMARK_REGISTER_F(Fixture, Cache)
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
 
+BENCHMARK_DEFINE_F(Fixture, CacheCPUOpenMP)
+(benchmark::State &st) { // NOLINT
+  auto policy = thrust::omp::par;
+  Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+      policy, model.begin(), model.end(), num_groups);
+  for (auto _ : st) {
+    Cache<decltype(policy), decltype(model)::value_type> preprocessed_model(
+        policy, model.begin(), model.end(), num_groups);
+  }
+}
+BENCHMARK_REGISTER_F(Fixture, CacheCPUOpenMP)
+    ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
+    ->Args({1, 10, 6, 1000})
+    ->Unit(benchmark::kMillisecond);
+
 BENCHMARK_DEFINE_F(Fixture, CacheCPU)
 (benchmark::State &st) { // NOLINT
   auto policy = thrust::host;
@@ -125,11 +141,10 @@ BENCHMARK_DEFINE_F(Fixture, CacheCPU)
         policy, model.begin(), model.end(), num_groups);
   }
 }
-BENCHMARK_REGISTER_F(Fixture, Cache)
+BENCHMARK_REGISTER_F(Fixture, CacheCPU)
     ->ArgNames({"n_rows", "n_feats", "max_depth", "n_leaves"})
     ->Args({1, 10, 6, 1000})
     ->Unit(benchmark::kMillisecond);
-
 BENCHMARK_DEFINE_F(Fixture, GPUTreeShapInterventional)
 (benchmark::State &st) { // NOLINT
   TestDataset R_test_data(1000, num_features, 1429);
